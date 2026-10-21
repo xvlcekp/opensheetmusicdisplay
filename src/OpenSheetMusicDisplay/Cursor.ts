@@ -1,0 +1,563 @@
+import {MusicPartManagerIterator} from "../MusicalScore/MusicParts/MusicPartManagerIterator";
+import {MusicPartManager} from "../MusicalScore/MusicParts/MusicPartManager";
+import {VoiceEntry} from "../MusicalScore/VoiceData/VoiceEntry";
+import {VexFlowStaffEntry} from "../MusicalScore/Graphical/VexFlow/VexFlowStaffEntry";
+import {MusicSystem} from "../MusicalScore/Graphical/MusicSystem";
+import {OpenSheetMusicDisplay} from "./OpenSheetMusicDisplay";
+import {GraphicalMusicSheet} from "../MusicalScore/Graphical/GraphicalMusicSheet";
+import {Instrument} from "../MusicalScore/Instrument";
+import {Note} from "../MusicalScore/VoiceData/Note";
+import {Fraction} from "../Common/DataObjects/Fraction";
+import { EngravingRules } from "../MusicalScore/Graphical/EngravingRules";
+import { SourceMeasure } from "../MusicalScore/VoiceData/SourceMeasure";
+import { StaffLine } from "../MusicalScore/Graphical/StaffLine";
+import { GraphicalMeasure } from "../MusicalScore/Graphical/GraphicalMeasure";
+import { VexFlowMeasure } from "../MusicalScore/Graphical/VexFlow/VexFlowMeasure";
+import { CursorOptions, CursorType } from "./OSMDOptions";
+import { BoundingBox } from "../MusicalScore/Graphical/BoundingBox";
+import { GraphicalNote } from "../MusicalScore/Graphical/GraphicalNote";
+
+/** A cursor which can iterate through the music sheet. */
+export class Cursor {
+  constructor(container: HTMLElement, openSheetMusicDisplay: OpenSheetMusicDisplay, cursorOptions: CursorOptions) {
+    this.container = container;
+    this.openSheetMusicDisplay = openSheetMusicDisplay;
+    this.rules = this.openSheetMusicDisplay.EngravingRules;
+    this.cursorOptions = cursorOptions;
+
+    // set cursor id
+    // TODO add this for the OSMD object as well and refactor this into a util method?
+    let id: number = 0;
+    this.cursorElementId = "cursorImg-0";
+    // find unique cursor id in document
+    while (document.getElementById(this.cursorElementId)) {
+      id++;
+      this.cursorElementId = `cursorImg-${id}`;
+    }
+
+    const curs: HTMLImageElement = document.createElement("img");
+    curs.id = this.cursorElementId;
+    curs.alt = ""; // decorative: screen readers skip it instead of announcing an unlabeled image
+    curs.draggable = false; // dragging on the cursor doesn't drag a copy of its image
+    curs.style.position = "absolute";
+    if (this.cursorOptions.follow === true) {
+      this.wantedZIndex = "-1";
+      curs.style.zIndex = this.wantedZIndex;
+    } else {
+      this.wantedZIndex = "-2";
+      curs.style.zIndex = this.wantedZIndex;
+    }
+    this.cursorElement = curs;
+    this.container.appendChild(curs);
+  }
+
+  public adjustToBackgroundColor(): void {
+    let zIndex: string;
+    if (!this.rules.PageBackgroundColor) {
+          zIndex = this.wantedZIndex;
+    } else {
+      zIndex = "1";
+    }
+    this.cursorElement.style.zIndex = zIndex;
+  }
+
+  private container: HTMLElement;
+  public cursorElement: HTMLImageElement;
+  /** a unique id of the cursor's HTMLElement in the document.
+   * Should be constant between re-renders and backend changes,
+   * but different between different OSMD objects on the same page.
+   */
+  public cursorElementId: string;
+  /** The desired zIndex (layer) of the cursor when no background color is set.
+   *  When a background color is set, using a negative zIndex would make the cursor invisible.
+   */
+  public wantedZIndex: string;
+  private openSheetMusicDisplay: OpenSheetMusicDisplay;
+  private rules: EngravingRules;
+  private manager: MusicPartManager;
+  public iterator: MusicPartManagerIterator;
+  private graphic: GraphicalMusicSheet;
+  public hidden: boolean = true;
+  public currentPageNumber: number = 1;
+  private cursorOptions: CursorOptions;
+  private cursorOptionsRendered: CursorOptions;
+  private cursorWidthRendered: number;
+  private skipInvisibleNotes: boolean = true;
+
+  /** Initialize the cursor. Necessary before using functions like show() and next(). */
+  public init(manager: MusicPartManager, graphic: GraphicalMusicSheet): void {
+    this.manager = manager;
+    this.graphic = graphic;
+    this.reset();
+    this.hidden = true;
+    this.hide();
+  }
+
+  /** Make the cursor visible. */
+  public show(): void {
+    this.hidden = false;
+    //this.resetIterator(); // TODO maybe not here? though setting measure range to draw, rerendering, then handling cursor show is difficult
+    this.update();
+    this.adjustToBackgroundColor();
+  }
+
+  public resetIterator(): void {
+    if (!this.openSheetMusicDisplay.Sheet || !this.openSheetMusicDisplay.Sheet.SourceMeasures) { // just a safety measure
+      console.log("OSMD.Cursor.resetIterator(): sheet or measures were null/undefined.");
+      return;
+    }
+
+    // set selection start, so that when there's MinMeasureToDraw set, the cursor starts there right away instead of at measure 1
+    const lastSheetMeasureIndex: number = this.openSheetMusicDisplay.Sheet.SourceMeasures.length - 1; // last measure in data model
+    let startMeasureIndex: number = this.rules.MinMeasureToDrawIndex;
+    startMeasureIndex = Math.min(startMeasureIndex, lastSheetMeasureIndex);
+    let endMeasureIndex: number = this.rules.MaxMeasureToDrawIndex;
+    if (this.rules.LazyConsistentGraphic) {
+      // Under lazy rendering MaxMeasureToDrawIndex is only the current (growing) frontier, not a fixed
+      //   draw range, so clamp the cursor to the whole sheet: it can step across the entire score and is
+      //   positioned lazily (update() no-ops where not yet rendered; a later batch repositions it once
+      //   that measure is drawn). Playback already seeks by timestamp and is unaffected by this range.
+      endMeasureIndex = lastSheetMeasureIndex;
+    }
+    endMeasureIndex = Math.min(endMeasureIndex, lastSheetMeasureIndex);
+
+    if (this.openSheetMusicDisplay.Sheet && this.openSheetMusicDisplay.Sheet.SourceMeasures.length > startMeasureIndex) {
+      this.openSheetMusicDisplay.Sheet.SelectionStart = this.openSheetMusicDisplay.Sheet.SourceMeasures[startMeasureIndex].AbsoluteTimestamp;
+    }
+    if (this.openSheetMusicDisplay.Sheet && this.openSheetMusicDisplay.Sheet.SourceMeasures.length > endMeasureIndex) {
+      const lastMeasure: SourceMeasure = this.openSheetMusicDisplay.Sheet.SourceMeasures[endMeasureIndex];
+      this.openSheetMusicDisplay.Sheet.SelectionEnd = Fraction.plus(lastMeasure.AbsoluteTimestamp, lastMeasure.Duration);
+    }
+
+    this.iterator = this.manager.getIterator();
+    // remember SkipInvisibleNotes setting, which otherwise gets reset to default value
+    this.iterator.SkipInvisibleNotes = this.skipInvisibleNotes;
+  }
+
+  private getStaffEntryFromVoiceEntry(voiceEntry: VoiceEntry): VexFlowStaffEntry {
+    const measureIndex: number = voiceEntry.ParentSourceStaffEntry.VerticalContainerParent.ParentMeasure.measureListIndex;
+    const staffIndex: number = voiceEntry.ParentSourceStaffEntry.ParentStaff.idInMusicSheet;
+    return <VexFlowStaffEntry>this.graphic.findGraphicalStaffEntryFromMeasureList(staffIndex, measureIndex, voiceEntry.ParentSourceStaffEntry);
+  }
+
+  /** Moves the cursor to the current position of the iterator (visually), e.g. after next(). */
+  public update(): void {
+    if (this.hidden || this.hidden === undefined || this.hidden === null) {
+      return;
+    }
+    this.updateCurrentPage(); // attach cursor to new page DOM if necessary
+    if (!this.getPageElement(this.currentPageNumber)) {
+      // the page isn't drawn, e.g. after drawUpToPageNumber, so the cursor can't be shown there.
+      //   It still moves (e.g. for NotesUnderCursor()), and is shown again on a drawn page.
+      this.cursorElement.style.display = "none";
+      return;
+    }
+
+    // this.graphic?.Cursors?.length = 0;
+    const iterator: MusicPartManagerIterator = this.iterator;
+    // TODO when measure draw range (drawUpToMeasureNumber) was changed, next/update can fail to move cursor. but of course it can be reset before.
+
+    let voiceEntries: VoiceEntry[] = iterator.CurrentVisibleVoiceEntries();
+    let currentMeasureIndex: number = iterator.CurrentMeasureIndex;
+    let x: number = 0, y: number = 0, height: number = 0;
+    let musicSystem: MusicSystem;
+    if (voiceEntries.length === 0 && !iterator.FrontReached && !iterator.EndReached) {
+      // e.g. when the note at the current position is in an instrument that's now invisible, and there's no other note at this position, vertically
+      iterator.moveToPrevious();
+      voiceEntries = iterator.CurrentVisibleVoiceEntries();
+      iterator.moveToNext();
+      // after this, the else condition below should trigger, positioning the cursor at the left-most note. See #1312
+    }
+    if (iterator.FrontReached && voiceEntries.length === 0) {
+      // show beginning of first measure (of stafflines, to create a visual difference to the first note position)
+      //   this position is technically before the sheet/first note - e.g. cursor.Iterator.CurrentTimestamp.RealValue = -1
+      iterator.moveToNext();
+      voiceEntries = iterator.CurrentVisibleVoiceEntries();
+      const firstVisibleMeasure: GraphicalMeasure = this.findVisibleGraphicalMeasure(iterator.CurrentMeasureIndex);
+      x = firstVisibleMeasure.PositionAndShape.AbsolutePosition.x;
+      musicSystem = firstVisibleMeasure.ParentMusicSystem;
+      iterator.moveToPrevious();
+    } else if (iterator.EndReached || !iterator.CurrentVoiceEntries || voiceEntries.length === 0) {
+      // show end of last measure (of stafflines, to create a visual difference to the first note position)
+      //   this position is technically after the sheet/last note - e.g. cursor.Iterator.CurrentTimestamp.RealValue = 99999
+      iterator.moveToPrevious();
+    voiceEntries = iterator.CurrentVisibleVoiceEntries();
+      currentMeasureIndex = iterator.CurrentMeasureIndex;
+      const lastVisibleMeasure: GraphicalMeasure = this.findVisibleGraphicalMeasure(iterator.CurrentMeasureIndex);
+      x = lastVisibleMeasure.PositionAndShape.AbsolutePosition.x + lastVisibleMeasure.PositionAndShape.Size.width;
+      musicSystem = lastVisibleMeasure.ParentMusicSystem;
+      iterator.moveToNext();
+    } else if (iterator.CurrentMeasure.isReducedToMultiRest) {
+      // multiple measure rests aren't used when one
+      const multiRestGMeasure: GraphicalMeasure = this.findVisibleGraphicalMeasure(iterator.CurrentMeasureIndex);
+      const totalRestMeasures: number = multiRestGMeasure.parentSourceMeasure.multipleRestMeasures;
+      const currentRestMeasureNumber: number = iterator.CurrentMeasure.multipleRestMeasureNumber;
+      const progressRatio: number = currentRestMeasureNumber / (totalRestMeasures + 1);
+      const effectiveWidth: number = multiRestGMeasure.PositionAndShape.Size.width - (multiRestGMeasure as VexFlowMeasure).beginInstructionsWidth;
+      x = multiRestGMeasure.PositionAndShape.AbsolutePosition.x + (multiRestGMeasure as VexFlowMeasure).beginInstructionsWidth + progressRatio * effectiveWidth;
+
+      musicSystem = multiRestGMeasure.ParentMusicSystem;
+    } else {
+      // get all staff entries inside the current voice entry
+      const gseArr: VexFlowStaffEntry[] = voiceEntries.map(ve => this.getStaffEntryFromVoiceEntry(ve));
+      // only use entries whose x position reliably reflects their timestamp: e.g. never-formatted
+      //   tablature rests carry garbage coordinates that would put the cursor far off-canvas
+      const reliableGseArr: VexFlowStaffEntry[] = gseArr.filter(entry => entry && this.graphic.isReliableCursorXAnchor(entry));
+      // sort them by x position and take the leftmost entry
+      const gse: VexFlowStaffEntry =
+            reliableGseArr.sort((a, b) => a?.PositionAndShape?.AbsolutePosition?.x <= b?.PositionAndShape?.AbsolutePosition?.x ? -1 : 1 )[0];
+      if (gse) {
+        x = gse.PositionAndShape.AbsolutePosition.x;
+        musicSystem = gse.parentMeasure.ParentMusicSystem;
+      } else if (gseArr.length > 0) {
+        // all entries at this position have unreliable positions: interpolate between the closest
+        //   reliable entries instead of jumping to a garbage x position
+        const [timestampX, timestampSystem] = this.graphic.calculateXPositionFromTimestamp(iterator.currentTimeStamp);
+        x = timestampX;
+        musicSystem = timestampSystem;
+      }
+
+      // debug: change color of notes under cursor (needs re-render)
+      // for (const gve of gse.graphicalVoiceEntries) {
+      //   for (const note of gve.notes) {
+      //     note.sourceNote.NoteheadColor = "#0000FF";
+      //   }
+      // }
+    }
+    if (!musicSystem?.StaffLines[0]) {
+      return;
+    }
+
+    // y is common for both multirest and non-multirest, given the MusicSystem
+    //   note: StaffLines[0] is guaranteed to exist in this.findVisibleGraphicalMeasure
+    y = musicSystem.PositionAndShape.AbsolutePosition.y + musicSystem.StaffLines[0].PositionAndShape.RelativePosition.y;
+    let endY: number = musicSystem.PositionAndShape.AbsolutePosition.y;
+    const bottomStaffline: StaffLine = musicSystem.StaffLines[musicSystem.StaffLines.length - 1];
+    if (bottomStaffline) { // can be undefined if drawFromMeasureNumber changed after cursor was shown
+      endY += bottomStaffline.PositionAndShape.RelativePosition.y + bottomStaffline.StaffHeight;
+    }
+    height = endY - y;
+
+    // Update the graphical cursor
+    const visibleMeasure: GraphicalMeasure = this.findVisibleGraphicalMeasure(currentMeasureIndex);
+    if (!visibleMeasure) {
+      return;
+    }
+    const measurePositionAndShape: BoundingBox = visibleMeasure.PositionAndShape;
+    this.updateWidthAndStyle(measurePositionAndShape, x, y, height);
+
+    if (this.openSheetMusicDisplay.FollowCursor && this.cursorOptions.follow) {
+      if (!this.openSheetMusicDisplay.EngravingRules.RenderSingleHorizontalStaffline) {
+        const diff: number = this.cursorElement.getBoundingClientRect().top;
+        this.cursorElement.scrollIntoView({behavior: diff < 1000 ? "smooth" : "auto", block: "center"});
+      } else {
+        this.cursorElement.scrollIntoView({behavior: "smooth", inline: "center"});
+      }
+    }
+    // Show cursor
+    // // Old cursor: this.graphic.Cursors.push(cursor);
+    this.cursorElement.style.display = "";
+  }
+
+  private findVisibleGraphicalMeasure(measureIndex: number): GraphicalMeasure {
+    for (let i: number = 0; i < this.graphic.NumberOfStaves; i++) {
+      const measure: GraphicalMeasure = this.graphic.findGraphicalMeasure(this.iterator.CurrentMeasureIndex, i);
+      if (measure?.ParentStaff.isVisible()) {
+        return measure;
+      }
+    }
+  }
+
+  public updateWidthAndStyle(measurePositionAndShape: BoundingBox, x: number, y: number, height: number): void {
+    const cursorElement: HTMLImageElement = this.cursorElement;
+    let newWidth: number = 0;
+    let newHeight: number = 0;
+    switch (this.cursorOptions.type) {
+      case CursorType.ThinLeft:
+        cursorElement.style.top = (y * 10.0 * this.openSheetMusicDisplay.zoom) + "px";
+        cursorElement.style.left = ((x - 1.5) * 10.0 * this.openSheetMusicDisplay.zoom) + "px";
+        newHeight = height * 10.0 * this.openSheetMusicDisplay.zoom;
+        newWidth = 5 * this.openSheetMusicDisplay.zoom;
+        break;
+      case CursorType.ShortThinTopLeft:
+        cursorElement.style.top = ((y-2.5) * 10.0 * this.openSheetMusicDisplay.zoom) + "px";
+        cursorElement.style.left = (x * 10.0 * this.openSheetMusicDisplay.zoom) + "px";
+        newHeight = 1.5 * 10.0 * this.openSheetMusicDisplay.zoom;
+        newWidth = 5 * this.openSheetMusicDisplay.zoom;
+        break;
+      case CursorType.CurrentArea:
+        cursorElement.style.top = measurePositionAndShape.AbsolutePosition.y * 10.0 * this.openSheetMusicDisplay.zoom +"px";
+        cursorElement.style.left = measurePositionAndShape.AbsolutePosition.x * 10.0 * this.openSheetMusicDisplay.zoom +"px";
+        newHeight = height * 10.0 * this.openSheetMusicDisplay.zoom;
+        newWidth = measurePositionAndShape.Size.width * 10 * this.openSheetMusicDisplay.zoom;
+        break;
+      case CursorType.CurrentAreaLeft:
+        cursorElement.style.top = measurePositionAndShape.AbsolutePosition.y * 10.0 * this.openSheetMusicDisplay.zoom +"px";
+        cursorElement.style.left = measurePositionAndShape.AbsolutePosition.x * 10.0 * this.openSheetMusicDisplay.zoom +"px";
+        newHeight = height * 10.0 * this.openSheetMusicDisplay.zoom;
+        newWidth = (x-measurePositionAndShape.AbsolutePosition.x) * 10 * this.openSheetMusicDisplay.zoom;
+        break;
+        default:
+        cursorElement.style.top = (y * 10.0 * this.openSheetMusicDisplay.zoom) + "px";
+        cursorElement.style.left = ((x - 1.5) * 10.0 * this.openSheetMusicDisplay.zoom) + "px";
+        newHeight = height * 10.0 * this.openSheetMusicDisplay.zoom;
+        newWidth = 3 * 10.0 * this.openSheetMusicDisplay.zoom;
+        break;
+    }
+
+    cursorElement.height = newHeight;
+    // the height also as inline style: page CSS overrides the height attribute, e.g. Tailwind's img { height: auto; },
+    //   which shrank the cursor to the 1 pixel height of its image. A height the app set with !important is kept.
+    if (cursorElement.style.getPropertyPriority("height") !== "important") {
+      cursorElement.style.height = newHeight + "px";
+    }
+    // if (newWidth !== cursorElement.width) { // this `if` is unnecessary and prevents updating color
+    cursorElement.width = newWidth;
+    if (this.cursorImageOutdated(newWidth)) {
+      this.updateStyle(newWidth, this.cursorOptions);
+      // only draw a new cursor image if it would look different. A solid color image is stretched to a new width,
+      //   the standard cursor's gradient is redrawn, which keeps it exact (see osmd#1519).
+    }
+  }
+
+  /** Whether updateStyle() would draw a different image than the current one.
+   *  The image only depends on the type, color and alpha options, and for the standard cursor's gradient on the width
+   *  (a solid color image is a single pixel, stretched to the width).
+   *  Compared by value: the options are usually changed in place (cursor.CursorOptions.color = ..., see #1519),
+   *  and cursorOptionsRendered is a clone, so comparing the objects themselves is always unequal.
+   */
+  private cursorImageOutdated(width: number): boolean {
+    const rendered: CursorOptions = this.cursorOptionsRendered;
+    return rendered === undefined ||
+      (width !== this.cursorWidthRendered && !this.hasSolidColor()) ||
+      rendered.type !== this.cursorOptions.type ||
+      rendered.color !== this.cursorOptions.color ||
+      rendered.alpha !== this.cursorOptions.alpha;
+  }
+
+  /** Hide the cursor. */
+  public hide(): void {
+    // Hide the actual cursor element
+    this.cursorElement.style.display = "none";
+    //this.graphic.Cursors.length = 0;
+    // Forcing the sheet to re-render is not necessary anymore
+    //if (!this.hidden) {
+    //    this.openSheetMusicDisplay.render();
+    //}
+    this.hidden = true;
+  }
+
+  /** Go to previous entry / note / vertical position. */
+   public previous(): void {
+    this.iterator.moveToPreviousVisibleVoiceEntry(false);
+    this.update();
+  }
+
+  /** Go to next entry / note / vertical position. */
+  public next(): void {
+    this.iterator.moveToNextVisibleVoiceEntry(false); // moveToNext() would not skip notes in hidden (visible = false) parts
+    this.update();
+  }
+
+  /** reset cursor to start position (start of sheet or osmd.Sheet.SelectionStart if set). */
+  public reset(): void {
+    this.resetIterator();
+    //this.iterator.moveToNext();
+    this.update();
+  }
+
+  /** updates cursor style (visually), e.g. cursor.cursorOptions.type or .color. */
+  private updateStyle(width: number, cursorOptions: CursorOptions = undefined): void {
+    if (cursorOptions !== undefined) {
+      this.cursorOptions = cursorOptions;
+    }
+    // Create a dummy canvas to generate the image for the cursor, one pixel high (the img element stretches it).
+    //   A solid color is also one pixel wide, the standard cursor's gradient as wide as the width attribute (rounded down).
+    const c: HTMLCanvasElement = document.createElement("canvas");
+    c.width = this.hasSolidColor() ? 1 : Math.max(1, Math.floor(width));
+    c.height = 1;
+    const ctx: CanvasRenderingContext2D = c.getContext("2d");
+    ctx.globalAlpha = this.cursorOptions.alpha;
+    ctx.fillStyle = this.cursorOptions.color;
+    ctx.fillRect(0, 0, c.width, 1);
+    if (!this.hasSolidColor()) {
+      // fade out to both sides by masking the alpha. A gradient from the color to "white" or "transparent" (black at alpha 0)
+      //   tints the edges, as canvas gradients don't interpolate with premultiplied alpha:
+      //   fading to white gave the cursor light edges on dark backgrounds.
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "destination-in";
+      const mask: CanvasGradient = ctx.createLinearGradient(0, 0, c.width, 0);
+      mask.addColorStop(0, "rgba(0,0,0,0)");
+      mask.addColorStop(0.2, "rgba(0,0,0,1)");
+      mask.addColorStop(0.8, "rgba(0,0,0,1)");
+      mask.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = mask;
+      ctx.fillRect(0, 0, c.width, 1);
+    }
+    this.cursorOptionsRendered = {...this.cursorOptions}; // clone, so that changes made in place are detected
+    this.cursorWidthRendered = width;
+    // Set the actual image
+    this.cursorElement.src = c.toDataURL("image/png");
+  }
+
+  /** Whether the cursor type is drawn in a solid color, which doesn't depend on the width
+   *  (the standard cursor fades out to both sides instead).
+   */
+  private hasSolidColor(): boolean {
+    switch (this.cursorOptions.type) {
+      case CursorType.ThinLeft:
+      case CursorType.ShortThinTopLeft:
+      case CursorType.CurrentArea:
+      case CursorType.CurrentAreaLeft:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  public get Iterator(): MusicPartManagerIterator {
+    return this.iterator;
+  }
+
+  public get Hidden(): boolean {
+    return this.hidden;
+  }
+
+  /** returns voices under the current Cursor position. Without instrument argument, all voices are returned. */
+  public VoicesUnderCursor(instrument?: Instrument): VoiceEntry[] {
+    return this.iterator.CurrentVisibleVoiceEntries(instrument);
+  }
+
+  public NotesUnderCursor(instrument?: Instrument): Note[] {
+    const voiceEntries: VoiceEntry[]  = this.VoicesUnderCursor(instrument);
+    const notes: Note[] = [];
+    voiceEntries.forEach(voiceEntry => {
+      notes.push(...voiceEntry.Notes);
+    });
+    return notes;
+  }
+
+  public GNotesUnderCursor(instrument?: Instrument): GraphicalNote[] {
+    const voiceEntries: VoiceEntry[]  = this.VoicesUnderCursor(instrument);
+    const notes: GraphicalNote[] = [];
+    voiceEntries.forEach(voiceEntry => {
+      notes.push(...voiceEntry.Notes.map(note => this.rules.GNote(note)));
+    });
+    return notes;
+  }
+
+  /** Check if there was a change in current page, and attach cursor element to the corresponding HTMLElement (div).
+   *  This is only necessary if using PageFormat (multiple pages).
+   */
+  public updateCurrentPage(): number {
+    let timestamp: Fraction = this.iterator.currentTimeStamp;
+    if (timestamp.RealValue < 0) {
+      timestamp = new Fraction(0, 0);
+    }
+    for (const page of this.graphic.MusicPages) {
+      const lastSystemTimestamp: Fraction = page.MusicSystems.last().GetSystemsLastTimeStamp();
+      if (lastSystemTimestamp.gt(timestamp)) {
+        // gt: the last timestamp of the last system is equal to the first of the next page,
+        //   so we do need to use gt, not gte here.
+        const newPageNumber: number = page.PageNumber;
+        if (newPageNumber !== this.currentPageNumber) {
+          this.attachToPage(newPageNumber);
+        }
+        return this.currentPageNumber = newPageNumber;
+      }
+    }
+    return 1;
+  }
+
+  /** Moves the cursor element to the element of the page with the given number (see getPageElement()), if the page is drawn.
+   *  A page that isn't drawn, e.g. after drawUpToPageNumber, has no element: the cursor element stays where it is,
+   *  and update() hides it.
+   */
+  private attachToPage(pageNumber: number): void {
+    const pageElement: HTMLElement = this.getPageElement(pageNumber);
+    if (!pageElement) {
+      return;
+    }
+    this.container.removeChild(this.cursorElement);
+    this.container = pageElement;
+    this.container.appendChild(this.cursorElement);
+    // TODO maybe store this.pageCurrentlyAttachedTo, though right now it isn't necessary
+    // alternative to remove/append:
+    // this.openSheetMusicDisplay.enableOrDisableCursor(true);
+  }
+
+  /** Returns the element (div) of this OSMD instance's page with the given number, which the cursor is attached to on that page.
+   *  Found through the instance's backends, not by the element's id "osmdCanvasPage" + page number: every OSMD instance
+   *  on a web page gives its pages the same ids, so document.getElementById() can return another instance's page.
+   */
+  private getPageElement(pageNumber: number): HTMLElement {
+    return this.openSheetMusicDisplay.Drawer.Backends[pageNumber - 1]?.getInnerElement();
+  }
+
+  public get SkipInvisibleNotes(): boolean {
+    return this.skipInvisibleNotes;
+  }
+
+  public set SkipInvisibleNotes(value: boolean) {
+    this.skipInvisibleNotes = value;
+    this.iterator.SkipInvisibleNotes = value;
+  }
+
+  public get CursorOptions(): CursorOptions {
+    return this.cursorOptions;
+  }
+
+  public set CursorOptions(value: CursorOptions) {
+    this.cursorOptions = value;
+  }
+
+  /** Hides and removes the cursor element, deletes object variables. */
+  public Dispose(): void {
+    this.hide();
+    this.container.removeChild(this.cursorElement);
+    this.rules = undefined;
+    this.openSheetMusicDisplay = undefined;
+    this.cursorOptions = undefined;
+  }
+
+  public nextMeasure(): void {
+    const startMeasure: SourceMeasure = this.Iterator.CurrentMeasure;
+    let previousTime: number = this.Iterator.currentTimeStamp.RealValue;
+    this.next();
+    let iterations: number = 0;
+    const maxIterations: number = 999;
+    while (this.Iterator.CurrentMeasure === startMeasure &&
+      this.Iterator.currentTimeStamp.RealValue !== previousTime &&
+      iterations < maxIterations // prevent infinite loop (not expected but for safety)
+    ) {
+      previousTime = this.Iterator.currentTimeStamp.RealValue;
+      this.next();
+      iterations++;
+    }
+  }
+
+  public previousMeasure(): void {
+    const startMeasure: SourceMeasure = this.Iterator.CurrentMeasure;
+    let previousTime: number = this.Iterator.currentTimeStamp.RealValue;
+    this.previous();
+    let iterations: number = 0;
+    const maxIterations: number = 999;
+    while (this.Iterator.CurrentMeasure === startMeasure &&
+      this.Iterator.currentTimeStamp.RealValue !== previousTime &&
+      iterations < maxIterations // prevent infinite loop (not expected but for safety)
+    ) {
+      previousTime = this.Iterator.currentTimeStamp.RealValue;
+      this.previous();
+      iterations++;
+    }
+
+    // move to start of measure
+    iterations = 0;
+    while (this.Iterator.CurrentRelativeInMeasureTimestamp.RealValue !== 0 &&
+      iterations < maxIterations
+    ) {
+      this.previous();
+      iterations++;
+    }
+  }
+}

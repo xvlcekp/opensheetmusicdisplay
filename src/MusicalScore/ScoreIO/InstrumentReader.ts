@@ -1,0 +1,1747 @@
+import {Instrument} from "../Instrument";
+import {MusicSheet} from "../MusicSheet";
+import {VoiceGenerator} from "./VoiceGenerator";
+import {Staff} from "../VoiceData/Staff";
+import {SourceMeasure} from "../VoiceData/SourceMeasure";
+import {SourceStaffEntry} from "../VoiceData/SourceStaffEntry";
+import {ClefInstruction} from "../VoiceData/Instructions/ClefInstruction";
+import {KeyInstruction} from "../VoiceData/Instructions/KeyInstruction";
+import {MeasureRepeatInstruction, MeasureRepeatType} from "../VoiceData/Instructions/MeasureRepeatInstruction";
+import {RhythmInstruction} from "../VoiceData/Instructions/RhythmInstruction";
+import {AbstractNotationInstruction} from "../VoiceData/Instructions/AbstractNotationInstruction";
+import {Fraction} from "../../Common/DataObjects/Fraction";
+import {IXmlElement} from "../../Common/FileIO/Xml";
+import {ITextTranslation} from "../Interfaces/ITextTranslation";
+import {MusicSheetReadingException} from "../Exceptions";
+import {ClefEnum} from "../VoiceData/Instructions/ClefInstruction";
+import {RhythmSymbolEnum} from "../VoiceData/Instructions/RhythmInstruction";
+import {KeyEnum} from "../VoiceData/Instructions/KeyInstruction";
+import {IXmlAttribute} from "../../Common/FileIO/Xml";
+import log from "loglevel";
+import {MidiInstrument} from "../VoiceData/Instructions/ClefInstruction";
+import {ChordSymbolReader} from "./MusicSymbolModules/ChordSymbolReader";
+import {ExpressionReader} from "./MusicSymbolModules/ExpressionReader";
+import {RepetitionInstructionReader} from "./MusicSymbolModules/RepetitionInstructionReader";
+import {SlurReader} from "./MusicSymbolModules/SlurReader";
+import {StemDirectionType, VoiceEntry} from "../VoiceData/VoiceEntry";
+import {NoteType, NoteTypeHandler} from "../VoiceData/NoteType";
+import { SystemLinesEnumHelper } from "../Graphical/SystemLinesEnum";
+import { ReaderPluginManager } from "./ReaderPluginManager";
+import { TremoloInfo } from "../VoiceData/Note";
+// import {Dictionary} from "typescript-collections";
+
+// FIXME: The following classes are missing
+//type ChordSymbolContainer = any;
+//type SlurReader = any;
+//type RepetitionInstructionReader = any;
+//declare class MusicSymbolModuleFactory {
+//  public static createSlurReader(x: any): any;
+//}
+//
+//class MetronomeReader {
+//  public static addMetronomeSettings(xmlNode: IXmlElement, musicSheet: MusicSheet): void { }
+//  public static readMetronomeInstructions(xmlNode: IXmlElement, musicSheet: MusicSheet, currentXmlMeasureIndex: number): void { }
+//  public static readTempoInstruction(soundNode: IXmlElement, musicSheet: MusicSheet, currentXmlMeasureIndex: number): void { }
+//}
+
+
+/**
+ * An InstrumentReader is used during the reading phase to keep parsing new measures from the MusicXML file
+ * with the readNextXmlMeasure method.
+ */
+export class InstrumentReader {
+
+  constructor(pluginManager: ReaderPluginManager, repetitionInstructionReader: RepetitionInstructionReader,
+    xmlMeasureList: IXmlElement[], instrument: Instrument) {
+      this.repetitionInstructionReader = repetitionInstructionReader;
+      this.xmlMeasureList = xmlMeasureList;
+      this.musicSheet = instrument.GetMusicSheet;
+      this.instrument = instrument;
+      this.activeClefs = new Array(instrument.Staves.length);
+      this.activeKeys = new Array(instrument.Staves.length);
+      this.activeKeysHaveBeenInitialized = new Array(instrument.Staves.length).fill(false);
+      this.activeClefsHaveBeenInitialized = new Array(instrument.Staves.length);
+      for (let i: number = 0; i < instrument.Staves.length; i++) {
+        this.activeClefsHaveBeenInitialized[i] = false;
+      }
+      this.createExpressionGenerators(instrument.Staves.length);
+      this.slurReader = new SlurReader(this.musicSheet);
+      this.pluginManager = pluginManager;
+  }
+
+  private repetitionInstructionReader: RepetitionInstructionReader;
+  private xmlMeasureList: IXmlElement[];
+  private musicSheet: MusicSheet;
+  private slurReader: SlurReader;
+  public pluginManager: ReaderPluginManager;
+  private instrument: Instrument;
+  private voiceGeneratorsDict: { [n: number]: VoiceGenerator } = {};
+  private staffMainVoiceGeneratorDict: { [staffId: number]: VoiceGenerator } = {};
+  private inSourceMeasureInstrumentIndex: number;
+  private divisions: number = 0;
+  private currentMeasure: SourceMeasure;
+  private previousMeasure: SourceMeasure;
+  private currentClefNumber: number = 1;
+  private currentXmlMeasureIndex: number = 0;
+  private currentStaff: Staff;
+  private currentStaffEntry: SourceStaffEntry;
+  private activeClefs: ClefInstruction[];
+  private activeKeys: KeyInstruction[];
+  private pendingEndKeys: KeyInstruction[] = [];
+  private measureEndFraction: Fraction;
+  private keyAtMeasureStart: number[];
+  private activeRhythm: RhythmInstruction;
+  private activeClefsHaveBeenInitialized: boolean[];
+  private activeKeysHaveBeenInitialized: boolean[];
+  private abstractInstructions: [number, AbstractNotationInstruction, Fraction][] = [];
+  //TODO: remove line below if it is not needed anymore?
+  //private openChordSymbolContainers: ChordSymbolContainer[] = [];
+  private expressionReaders: ExpressionReader[];
+  private currentVoiceGenerator: VoiceGenerator;
+  //private openSlurDict: { [n: number]: Slur; } = {};
+  private maxTieNoteFraction: Fraction;
+  private currentMultirestStartMeasure: SourceMeasure;
+  private followingMultirestMeasures: number;
+
+  public get ActiveKey(): KeyInstruction {
+    return this.activeKeys[0];
+  }
+
+  public get MaxTieNoteFraction(): Fraction {
+    return this.maxTieNoteFraction;
+  }
+
+  public get ActiveRhythm(): RhythmInstruction {
+    return this.activeRhythm;
+  }
+
+  public set ActiveRhythm(value: RhythmInstruction) {
+    this.activeRhythm = value;
+  }
+
+  /**
+   * Main CreateSheet: read the next XML Measure and save all data to the given [[SourceMeasure]].
+   * @param currentMeasure
+   * @param measureStartAbsoluteTimestamp - Using this instead of currentMeasure.AbsoluteTimestamp as it isn't set yet
+   * @param octavePlusOne Software like Guitar Pro gives one octave too low, so we need to add one
+   * @param readNotationDynamics Whether to read the `<dynamics>` in a note's `<notations>` (not those of Guitar Pro 5, which
+   *   gives every note its dynamic there, its velocity)
+   * @returns {boolean}
+   */
+  public readNextXmlMeasure(currentMeasure: SourceMeasure, measureStartAbsoluteTimestamp: Fraction, octavePlusOne: boolean,
+                            readNotationDynamics: boolean = true): boolean {
+    if (this.currentXmlMeasureIndex >= this.xmlMeasureList.length) {
+      return false;
+    }
+    this.currentMeasure = currentMeasure;
+    this.followingMultirestMeasures = Math.max(this.followingMultirestMeasures - 1, 0);
+    this.inSourceMeasureInstrumentIndex = this.musicSheet.getGlobalStaffIndexOfFirstStaff(this.instrument);
+    for (let staffIndex: number = 0; staffIndex < this.pendingEndKeys.length; staffIndex++) {
+      const key: KeyInstruction = this.pendingEndKeys[staffIndex];
+      if (key) {
+        this.storeInitialKeyInstruction(currentMeasure, staffIndex, key);
+        this.activeKeys[staffIndex] = key;
+      }
+    }
+    this.pendingEndKeys = [];
+    this.keyAtMeasureStart = Array.from(this.activeKeys, (key: KeyInstruction): number => key?.Key ?? 0);
+    if (this.repetitionInstructionReader) {
+     this.repetitionInstructionReader.prepareReadingMeasure(currentMeasure, this.currentXmlMeasureIndex);
+    }
+    let currentFraction: Fraction = new Fraction(0, 1);
+    let previousFraction: Fraction = new Fraction(0, 1);
+    this.measureEndFraction = new Fraction(0, 1);
+    let divisionsException: boolean = false;
+    this.maxTieNoteFraction = new Fraction(0, 1);
+    let lastNoteWasGrace: boolean = false;
+    try {
+      const measureNode: IXmlElement = this.xmlMeasureList[this.currentXmlMeasureIndex];
+      const xmlMeasureListArr: IXmlElement[] = measureNode.elements();
+      let measureNumberXml: number;
+      if (currentMeasure.Rules.UseXMLMeasureNumbers && !Number.isInteger(currentMeasure.MeasureNumberXML)) {
+        measureNumberXml = parseInt(measureNode.attribute("number")?.value, 10);
+        if (Number.isInteger(measureNumberXml)) {
+            currentMeasure.MeasureNumberXML = measureNumberXml;
+        }
+      }
+      if (measureNode.attribute("implicit")?.value === "yes") {
+        currentMeasure.ImplicitMeasureFromXml = true; // by default these don't show a measure number, see RenderMeasureNumbersForImplicitMeasures
+      }
+      const widthFactorAttr: IXmlAttribute = measureNode.attribute("osmdWidthFactor"); // custom xml attribute
+      if (widthFactorAttr) {
+        const widthFactorValue: number = Number.parseFloat(widthFactorAttr.value);
+        if (typeof widthFactorValue === "number" && !isNaN(widthFactorValue)) {
+          currentMeasure.WidthFactor = widthFactorValue;
+        } else {
+          log.info(`xml parse: osmdWidthFactor invalid for measure ${measureNumberXml}`);
+        }
+      }
+      let previousNode: IXmlElement; // needs a null check when accessed because of node index 0!
+      for (let xmlNodeIndex: number = 0; xmlNodeIndex < xmlMeasureListArr.length; xmlNodeIndex++) {
+        const xmlNode: IXmlElement = xmlMeasureListArr[xmlNodeIndex];
+        if (xmlNodeIndex > 0) {
+          previousNode = xmlMeasureListArr[xmlNodeIndex - 1];
+        }
+        if (xmlNode.name === "print") {
+          const newSystemAttr: IXmlAttribute = xmlNode.attribute("new-system");
+          if (newSystemAttr?.value === "yes") {
+            currentMeasure.printNewSystemXml = true;
+          }
+          const newPageAttr: IXmlAttribute = xmlNode.attribute("new-page");
+          if (newPageAttr?.value === "yes") {
+            currentMeasure.printNewPageXml = true;
+          }
+        } else if (xmlNode.name === "attributes") {
+          const divisionsNode: IXmlElement = xmlNode.element("divisions");
+          if (divisionsNode) {
+            this.divisions = parseInt(divisionsNode.value, 10);
+            if (isNaN(this.divisions)) {
+              const errorMsg: string = ITextTranslation.translateText("ReaderErrorMessages/DivisionError",
+                  "Invalid divisions value at Instrument: ");
+              log.debug("InstrumentReader.readNextXmlMeasure", errorMsg);
+              this.divisions = this.readDivisionsFromNotes();
+              if (this.divisions > 0) {
+                this.musicSheet.SheetErrors.push(errorMsg + this.instrument.Name);
+              } else {
+                divisionsException = true;
+                throw new MusicSheetReadingException(errorMsg + this.instrument.Name);
+              }
+            }
+          }
+          if (
+              !xmlNode.element("divisions") &&
+              this.divisions === 0 &&
+              this.currentXmlMeasureIndex === 0
+          ) {
+            const errorMsg: string = ITextTranslation.translateText("ReaderErrorMessages/DivisionError", "Invalid divisions value at Instrument: ");
+            this.divisions = this.readDivisionsFromNotes();
+            if (this.divisions > 0) {
+              this.musicSheet.SheetErrors.push(errorMsg + this.instrument.Name);
+            } else {
+              divisionsException = true;
+              throw new MusicSheetReadingException(errorMsg + this.instrument.Name);
+            }
+          }
+          this.addAbstractInstruction(xmlNode, octavePlusOne, previousNode, currentFraction.clone());
+          if (currentFraction.Equals(new Fraction(0, 1)) &&
+              this.isAttributesNodeAtBeginOfMeasure(this.xmlMeasureList[this.currentXmlMeasureIndex], xmlNode)) {
+            this.saveAbstractInstructionList(this.instrument.Staves.length, true);
+            this.readMeasureRepeats(xmlNode);
+          }
+          if (this.isAttributesNodeAtEndOfMeasure(this.xmlMeasureList[this.currentXmlMeasureIndex], xmlNode, currentFraction)) {
+            this.saveClefInstructionAtEndOfMeasure();
+          }
+          const staffDetailsNodes: IXmlElement[] = xmlNode.elements("staff-details"); // there can be multiple, even if redundant. see #1041
+          for (const staffDetailsNode of staffDetailsNodes) {
+            const staffLinesNode: IXmlElement = staffDetailsNode.element("staff-lines");
+            if (staffLinesNode) {
+              let staffNumber: number = 1;
+              const staffNumberAttr: Attr = staffDetailsNode.attribute("number");
+              if (staffNumberAttr) {
+                staffNumber = parseInt(staffNumberAttr.value, 10);
+              }
+              const staff: Staff = this.instrument.Staves[staffNumber - 1];
+              staff.StafflineCount = parseInt(staffLinesNode.value, 10);
+              staff.xmlStafflineCount = isNaN(staff.StafflineCount) ? undefined : staff.StafflineCount;
+            }
+          }
+          // check multi measure rest
+          const measureStyle: IXmlElement = xmlNode.element("measure-style");
+          if (measureStyle) {
+            const multipleRest: IXmlElement = measureStyle.element("multiple-rest");
+            if (multipleRest) {
+              // TODO: save multirest per staff info a dictionary, to display a partial multirest if multirest values across staffs differ.
+              //   this makes the code bulkier though, and for now we only draw multirests if the staffs have the same multirest lengths.
+              // if (!currentMeasure.multipleRestMeasuresPerStaff) {
+              //   currentMeasure.multipleRestMeasuresPerStaff = new Dictionary<number, number>();
+              // }
+              const multipleRestValueXml: string = multipleRest.value;
+              let multipleRestNumber: number = 0;
+              try {
+                multipleRestNumber = Number.parseInt(multipleRestValueXml, 10);
+                if (currentMeasure.multipleRestMeasures !== undefined && multipleRestNumber !== currentMeasure.multipleRestMeasures) {
+                  // different multi-rest values in same measure for different staffs
+                  currentMeasure.multipleRestMeasures = 0; // for now, ignore multirest here. TODO: take minimum
+                  // currentMeasure.multipleRestMeasuresPerStaff.setValue(this.currentStaff?.Id, multipleRestNumber);
+                  //   issue: currentStaff can be undefined for first measure
+                } else {
+                  currentMeasure.multipleRestMeasures = multipleRestNumber;
+                  this.currentMultirestStartMeasure = currentMeasure;
+                  this.followingMultirestMeasures = multipleRestNumber + 1; // will be decremented at the start of the loop
+                }
+              } catch (e) {
+                console.log("multirest parse error: " + e);
+              }
+            }
+          }
+        } else if (xmlNode.name === "note") {
+          let printObject: boolean = true;
+          if (xmlNode.attribute("print-object")?.value === "no") {
+              printObject = false; // note will not be rendered, but still parsed for Playback etc.
+              // if (xmlNode.attribute("print-spacing")) {
+              //   if (xmlNode.attribute("print-spacing").value === "yes" {
+              //     // TODO give spacing for invisible notes even when not displayed. might be hard with Vexflow formatting
+          }
+          const noteStaff: number = this.getNoteStaff(xmlNode);
+
+          this.currentStaff = this.instrument.Staves[noteStaff - 1];
+          const isChord: boolean = xmlNode.element("chord") !== undefined;
+          if (xmlNode.element("voice")) {
+            const noteVoice: number = parseInt(xmlNode.element("voice").value, 10);
+            this.currentVoiceGenerator = this.getOrCreateVoiceGenerator(noteVoice, noteStaff - 1);
+          } else {
+            if (!isChord || !this.currentVoiceGenerator) {
+              this.currentVoiceGenerator = this.getOrCreateVoiceGenerator(1, noteStaff - 1);
+            }
+          }
+          let noteDivisions: number = 0;
+          let noteDuration: Fraction = new Fraction(0, 1);
+          let normalNotes: number = 2;
+          let typeDuration: Fraction = undefined;
+          const restNote: boolean = xmlNode.element("rest") !== undefined;
+          // let isTuplet: boolean = false; // unused now
+          if (xmlNode.element("duration")) {
+            // some MusicXML exporters place <attributes><divisions> after the first notes of measure 1
+            // (see Jingle_Bell_Rock.xml). Without divisions, noteDuration becomes NaN and propagates
+            // through every staff entry's Timestamp, breaking later layout (e.g. lyric extends).
+            if (this.divisions === 0 && this.currentXmlMeasureIndex === 0) {
+              this.divisions = this.readDivisionsFromNotes();
+              if (this.divisions === 0) {
+                const errorMsg: string = ITextTranslation.translateText("ReaderErrorMessages/DivisionError",
+                  "Invalid divisions value at Instrument: ");
+                divisionsException = true;
+                throw new MusicSheetReadingException(errorMsg + this.instrument.Name);
+              }
+              this.musicSheet.SheetErrors.push(
+                ITextTranslation.translateText("ReaderErrorMessages/DivisionError", "Invalid divisions value at Instrument: ")
+                  + this.instrument.Name);
+            }
+            noteDivisions = parseInt(xmlNode.element("duration").value, 10);
+            if (!isNaN(noteDivisions)) {
+              noteDuration = new Fraction(noteDivisions, 4 * this.divisions);
+              if (restNote && noteDuration.RealValue > this.ActiveRhythm?.Rhythm.RealValue) {
+                // bug in Virtual Sheet Music Playground and potentially other exporters
+                //   that assigns 4 quarters (whole note) duration to full measure rest in 2/4 measures
+                // note that this.ActiveRhythm can be undefined in some test samples
+                noteDuration = this.ActiveRhythm.Rhythm.clone();
+              }
+              if (noteDivisions === 0) {
+                noteDuration = this.getNoteDurationFromTypeNode(xmlNode);
+              } else {
+                typeDuration = this.getNoteDurationFromTypeNode(xmlNode);
+              }
+              if (xmlNode.element("time-modification")) {
+                noteDuration = this.getNoteDurationForTuplet(xmlNode);
+                const time: IXmlElement = xmlNode.element("time-modification");
+                if (time?.element("normal-notes")) {
+                  normalNotes = parseInt(time.element("normal-notes").value, 10);
+                }
+                // isTuplet = true;
+              }
+            } else {
+              const errorMsg: string = ITextTranslation.translateText("ReaderErrorMessages/NoteDurationError", "Invalid Note Duration.");
+              this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+              log.debug("InstrumentReader.readNextXmlMeasure", errorMsg);
+              continue;
+            }
+          }
+
+          //log.info("New note found!", noteDivisions, noteDuration.toString(), restNote);
+
+          const notationsNode: IXmlElement = xmlNode.combinedElement("notations"); // select all notation nodes
+
+          const isGraceNote: boolean = xmlNode.element("grace") !== undefined || noteDivisions === 0 || isChord && lastNoteWasGrace;
+          let graceNoteSlash: boolean = false;
+          let graceSlur: boolean = false;
+          if (isGraceNote) {
+            const graceNode: IXmlElement = xmlNode.element("grace");
+            if (graceNode && graceNode.attributes()) {
+              if (graceNode.attribute("slash")) {
+                const slash: string = graceNode.attribute("slash").value;
+                if (slash === "yes") {
+                  graceNoteSlash = true;
+                }
+              }
+            }
+
+            noteDuration = this.getNoteDurationFromTypeNode(xmlNode);
+
+            if (notationsNode && notationsNode.element("slur")) {
+              graceSlur = true;
+              // grace slurs could be non-binary, but VexFlow.GraceNoteGroup modifier system is currently only boolean for slurs.
+            }
+          }
+
+          // check for cue note
+          const [isCueNote, noteTypeXml] = this.getCueNoteAndNoteTypeXml(xmlNode);
+
+          // check stem element
+          const [stemDirectionXml, stemColorXml, noteheadColorXml] = this.getStemDirectionAndColors(xmlNode);
+
+          // check Tremolo, Vibrato
+          let tremoloInfo: TremoloInfo;
+          //let vibratoStrokes: boolean = false; // not necessary, handled by wavy-line
+          if (notationsNode) {
+            const ornamentsNode: IXmlElement = notationsNode.element("ornaments");
+            if (ornamentsNode) {
+              tremoloInfo = this.getTremoloInfo(ornamentsNode);
+              this.getWavyLines(ornamentsNode, xmlNode, currentFraction, previousFraction);
+            }
+          }
+
+          const musicTimestamp: Fraction = isChord ? previousFraction.clone() : currentFraction.clone();
+          this.currentStaffEntry = this.currentMeasure.findOrCreateStaffEntry(
+            musicTimestamp,
+            this.inSourceMeasureInstrumentIndex + noteStaff - 1,
+            this.currentStaff
+          ).staffEntry;
+          //log.info("currentStaffEntry", this.currentStaffEntry, this.currentMeasure.VerticalSourceStaffEntryContainers.length);
+
+          if (!this.currentVoiceGenerator.hasVoiceEntry()
+            || (!isChord && !isGraceNote && !lastNoteWasGrace)
+            || (isGraceNote && !lastNoteWasGrace)
+            || (isGraceNote && !isChord)
+            || (!isGraceNote && lastNoteWasGrace)
+          ) {
+            this.currentVoiceGenerator.createVoiceEntry(musicTimestamp, this.currentStaffEntry, !isGraceNote,
+                                                        isGraceNote, graceNoteSlash, graceSlur);
+            // we previously excluded rest notes from a voice's voice entry (!restNote && !isGraceNote),
+            //   but there seems to be no reason to. Rest notes also belong to a voice line. See #1612
+          }
+          if (!isGraceNote && !isChord) {
+            previousFraction = currentFraction.clone();
+            currentFraction.Add(noteDuration);
+          }
+          if (
+            isChord &&
+            this.currentStaffEntry !== undefined &&
+            this.currentStaffEntry.ParentStaff !== this.currentStaff
+          ) {
+            this.currentStaffEntry = this.currentVoiceGenerator.checkForStaffEntryLink(
+              this.inSourceMeasureInstrumentIndex + noteStaff - 1, this.currentStaff, this.currentStaffEntry, this.currentMeasure
+            );
+          }
+          const beginOfMeasure: boolean = (
+            this.currentStaffEntry !== undefined &&
+            this.currentStaffEntry.Timestamp !== undefined &&
+            this.currentStaffEntry.Timestamp.Equals(new Fraction(0, 1)) && !this.currentStaffEntry.hasNotes()
+          );
+          this.saveAbstractInstructionList(this.instrument.Staves.length, beginOfMeasure);
+          // this if block handles harmony/chords on the next note/staffentry element, so it assumes that a
+          //   harmony is given before the staff entry, but when a harmony is given after a staff entry element with a backup node,
+          //   it is put on the next note/staffentry and the last chord item is never parsed at all.
+          //   see PR #1342
+          // if (this.openChordSymbolContainers.length !== 0) {
+          //   this.currentStaffEntry.ChordContainers = this.openChordSymbolContainers;
+          //   // TODO handle multiple chords on one note/staffentry
+          //   this.openChordSymbolContainers = [];
+          // }
+          if (this.activeRhythm) {
+            // (*) this.musicSheet.SheetPlaybackSetting.Rhythm = this.activeRhythm.Rhythm;
+          }
+          const dots: number = xmlNode.elements("dot").length;
+          this.currentVoiceGenerator.read(
+            xmlNode, noteDuration, typeDuration, noteTypeXml, normalNotes, restNote,
+            this.currentStaffEntry, this.currentMeasure,
+            measureStartAbsoluteTimestamp,
+            this.maxTieNoteFraction, isChord, octavePlusOne,
+            printObject, isCueNote, isGraceNote, stemDirectionXml, tremoloInfo, stemColorXml, noteheadColorXml,
+            dots
+          );
+
+          // notationsNode created further up for multiple checks
+          if (readNotationDynamics && notationsNode !== undefined && notationsNode.element("dynamics")) {
+            const expressionReader: ExpressionReader = this.expressionReaders[this.readExpressionStaffNumber(xmlNode) - 1];
+            if (expressionReader) {
+             // a note's <dynamics> have their own placement attribute (a direction's dynamics have the direction's)
+             expressionReader.readExpressionParameters(
+               notationsNode.element("dynamics"), this.instrument, this.divisions, currentFraction, previousFraction,
+               this.currentMeasure.MeasureNumber, false
+             );
+             // the <notations> contain the <dynamics> as a direction's <direction-type> does. They belong to the note's
+             //   timestamp (previousFraction is the one of the note before a grace note).
+             expressionReader.read(
+               xmlNode, this.currentMeasure, musicTimestamp, undefined, [notationsNode]
+             );
+            }
+          }
+          lastNoteWasGrace = isGraceNote;
+        } else if (xmlNode.name === "forward") {
+          const forFraction: number = parseInt(xmlNode.element("duration").value, 10);
+          currentFraction.Add(new Fraction(forFraction, 4 * this.divisions));
+        } else if (xmlNode.name === "backup") {
+          const backFraction: number = parseInt(xmlNode.element("duration").value, 10);
+          currentFraction.Sub(new Fraction(backFraction, 4 * this.divisions));
+          if (currentFraction.IsNegative()) {
+            currentFraction = new Fraction(0, 1);
+          }
+          previousFraction.Sub(new Fraction(backFraction, 4 * this.divisions));
+          if (previousFraction.IsNegative()) {
+            previousFraction = new Fraction(0, 1);
+          }
+        } else if (xmlNode.name === "direction") {
+          const directionTypeNodes: IXmlElement[] = xmlNode.elements("direction-type");
+          const directionTypeNode: IXmlElement = directionTypeNodes[0]; // kept for repetition handler
+          // (*) MetronomeReader.readMetronomeInstructions(xmlNode, this.musicSheet, this.currentXmlMeasureIndex);
+          let relativePositionInMeasure: number = Math.min(1, currentFraction.RealValue);
+          if (this.activeRhythm !== undefined && this.activeRhythm.Rhythm) {
+            relativePositionInMeasure /= this.activeRhythm.Rhythm.RealValue;
+          }
+          let handeled: boolean = false;
+          if (this.repetitionInstructionReader) {
+            handeled = this.repetitionInstructionReader.handleRepetitionInstructionsFromWordsOrSymbols( directionTypeNode,
+                                                                                                        relativePositionInMeasure,
+                                                                                                        xmlNode.element("sound"));
+          }
+          if (!handeled || directionTypeNodes.length > 1) {
+           let expressionReader: ExpressionReader = this.expressionReaders[0];
+           const staffIndex: number = this.readExpressionStaffNumber(xmlNode) - 1;
+           if (staffIndex < this.expressionReaders.length) {
+             expressionReader = this.expressionReaders[staffIndex];
+           }
+           if (expressionReader) {
+             if (directionTypeNodes.some(dt => dt.element("octave-shift"))) {
+               expressionReader.readExpressionParameters(
+                 xmlNode, this.instrument, this.divisions, currentFraction, previousFraction, this.currentMeasure.MeasureNumber, true
+               );
+               // Count how many VoiceEntries at the current timestamp were parsed before this stop.
+               // Grace notes before/after a stop share the same timestamp; this count lets the
+               // renderer distinguish which VoiceEntries fall under the octave shift.
+               let endVoiceEntryCount: number = 0;
+               let endFraction: Fraction;
+               if (this.currentStaffEntry?.Timestamp?.Equals(currentFraction)) {
+                 // Grace notes at this timestamp — use currentFraction and track which entries are covered
+                 endVoiceEntryCount = this.currentStaffEntry.VoiceEntries.length;
+                 endFraction = currentFraction.clone();
+               } else {
+                 // Normal case: last note was a real note, use previousFraction
+                 endFraction = previousFraction.clone();
+               }
+               expressionReader.addOctaveShift(xmlNode, this.currentMeasure, endFraction, endVoiceEntryCount);
+             }
+             if (directionTypeNodes.some(dt => dt.element("pedal"))) {
+              expressionReader.readExpressionParameters(
+                xmlNode, this.instrument, this.divisions, currentFraction, previousFraction, this.currentMeasure.MeasureNumber, true
+              );
+              expressionReader.addPedalMarking(xmlNode, this.currentMeasure, currentFraction.clone());
+              // pedal end in OSMD and Vexflow means end BEFORE timestamp, so currentFraction instead of previousFraction needs to be used.
+             }
+             expressionReader.readExpressionParameters(
+               xmlNode, this.instrument, this.divisions, currentFraction, previousFraction, this.currentMeasure.MeasureNumber, false
+             );
+             expressionReader.read(xmlNode, this.currentMeasure, currentFraction, previousFraction.clone(),
+                                   handeled ? directionTypeNodes.slice(1) : directionTypeNodes);
+           }
+          }
+        } else if (xmlNode.name === "barline") {
+          if (this.repetitionInstructionReader) {
+           const measureEndsSystem: boolean = this.repetitionInstructionReader.handleLineRepetitionInstructions(xmlNode);
+           if (measureEndsSystem) {
+             this.currentMeasure.HasEndLine = true;
+           }
+          }
+          const location: IXmlAttribute = xmlNode.attribute("location");
+          const locationValue: string = location?.value ?? "right"; // right is assumed by default in MusicXML spec, see #1522
+          const isEndingBarline: boolean = (xmlNodeIndex === xmlMeasureListArr.length - 1);
+          if (isEndingBarline || locationValue === "right") {
+            const stringValue: string = xmlNode.element("bar-style")?.value;
+            // TODO apparently we didn't anticipate bar-style not existing (the ? above was missing). how to handle?
+            if (stringValue) {
+              this.currentMeasure.endingBarStyleXml = stringValue;
+              this.currentMeasure.endingBarStyleEnum = SystemLinesEnumHelper.xmlBarlineStyleToSystemLinesEnum(stringValue);
+            }
+          }
+          // TODO do we need to process bars with left location too?
+        } else if (xmlNode.name === "sound") {
+          // (*) MetronomeReader.readTempoInstruction(xmlNode, this.musicSheet, this.currentXmlMeasureIndex);
+          try {
+            if (xmlNode.attribute("tempo")) { // can be null, not just undefined!
+
+                const tempo: number = parseFloat(xmlNode.attribute("tempo").value);
+
+                // should set the PlaybackSettings only at first Measure
+                if (this.currentXmlMeasureIndex === 0) {
+                    this.musicSheet.DefaultStartTempoInBpm = tempo;
+                    this.musicSheet.HasBPMInfo = true;
+                }
+            }
+          } catch (e) {
+            log.debug("InstrumentReader.readTempoInstruction", e);
+          }
+        } else if (xmlNode.name === "harmony") {
+          const noteStaff: number = this.getNoteStaff(xmlNode);
+          this.currentStaff = this.instrument.Staves[noteStaff - 1];
+          // new chord, could be second chord on same staffentry/note
+          const musicTimestamp: Fraction = currentFraction.clone();
+          this.currentStaffEntry = this.currentMeasure.findOrCreateStaffEntry(
+              musicTimestamp, this.inSourceMeasureInstrumentIndex + noteStaff - 1, this.currentStaff).staffEntry;
+          this.currentStaffEntry.ChordContainers.push(
+            ChordSymbolReader.readChordSymbol(xmlNode, this.musicSheet, this.activeKeys[noteStaff - 1])
+          );
+        }
+        this.measureEndFraction = Fraction.max(this.measureEndFraction, currentFraction).clone();
+      }
+      for (const j in this.voiceGeneratorsDict) {
+        if (this.voiceGeneratorsDict.hasOwnProperty(j)) {
+          const voiceGenerator: VoiceGenerator = this.voiceGeneratorsDict[j];
+          voiceGenerator.checkForOpenBeam();
+        }
+      }
+      this.attachGraceNotesAfterMainNote();
+      this.savePendingClefInstructions();
+      if (this.currentXmlMeasureIndex === this.xmlMeasureList.length - 1) {
+        for (let i: number = 0; i < this.instrument.Staves.length; i++) {
+          if (!this.activeClefsHaveBeenInitialized[i]) {
+            this.createDefaultClefInstruction(this.musicSheet.getGlobalStaffIndexOfFirstStaff(this.instrument) + i);
+          }
+        }
+        for (let staffIndex: number = 0; staffIndex < this.instrument.Staves.length; staffIndex++) {
+          if (!this.activeKeysHaveBeenInitialized[staffIndex]) {
+            this.createDefaultKeyInstruction(staffIndex);
+          }
+        }
+
+        for (let i: number = 0; i < this.expressionReaders.length; i++) {
+         const reader: ExpressionReader = this.expressionReaders[i];
+         if (reader) {
+           reader.closeOpenExpressions(this.currentMeasure, currentFraction);
+          }
+        }
+      }
+
+      // if this is the first measure and no BPM info found, we set it to 120
+      // next measures will automatically inherit that value
+      if (!this.musicSheet.HasBPMInfo) {
+        this.currentMeasure.TempoInBPM = 120;
+      } else if (currentMeasure.TempoInBPM === 0 && this.previousMeasure) {
+        this.currentMeasure.TempoInBPM = this.previousMeasure.TempoInBPM;
+      }
+    } catch (e) {
+      if (divisionsException) {
+        throw new MusicSheetReadingException(e.Message);
+      }
+      const errorMsg: string = ITextTranslation.translateText("ReaderErrorMessages/MeasureError", "Error while reading Measure.");
+      this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+      log.debug("InstrumentReader.readNextXmlMeasure", errorMsg, e);
+    }
+
+    this.previousMeasure = this.currentMeasure;
+    this.currentXmlMeasureIndex += 1;
+    return true;
+  }
+
+  /**
+   * Attaches grace notes after the last main note of a staff in this measure (a Nachschlag, e.g. the two small notes ending
+   * a trill: MusicXML puts them after their main note, without a following note) to that main note's [[SourceStaffEntry]],
+   * marked with VoiceEntry.GraceAfterMainNote. Having no duration, they were read into an own staff entry at the main note's
+   * end timestamp, i.e. at the end of the measure, which made the cursor stop on them separately (#1706) and even lengthened
+   * the measure by their notated length (SourceMeasure.Duration). They are still drawn right of the main note as their own
+   * small notes (VexFlowMeasure.graphicalMeasureCreatedCalculations). The emptied staff entry is removed afterwards by
+   * MusicSheetReader.checkSourceMeasureForNullEntries(). Grace notes before a following main note are not affected.
+   */
+  private attachGraceNotesAfterMainNote(): void {
+    for (let staffIndexInInstrument: number = 0; staffIndexInInstrument < this.instrument.Staves.length; staffIndexInInstrument++) {
+      const staffIndex: number = this.inSourceMeasureInstrumentIndex + staffIndexInInstrument;
+      // one pass over the voice entries of the staff (in timestamp order) for the grace notes after its last main note,
+      //   and for the last main note of each voice, which is the main note they belong to
+      const lastMainVoiceEntries: { [voiceId: number]: VoiceEntry } = {};
+      let graceVoiceEntriesAfterMainNote: VoiceEntry[] = [];
+      for (const container of this.currentMeasure.VerticalSourceStaffEntryContainers) {
+        const staffEntry: SourceStaffEntry = container.StaffEntries[staffIndex];
+        if (!staffEntry) {
+          continue;
+        }
+        for (const voiceEntry of staffEntry.VoiceEntries) {
+          if (voiceEntry.IsGrace) {
+            graceVoiceEntriesAfterMainNote.push(voiceEntry);
+          } else {
+            lastMainVoiceEntries[voiceEntry.ParentVoice.VoiceId] = voiceEntry;
+            graceVoiceEntriesAfterMainNote = []; // grace notes before this main note stay in its staff entry
+          }
+        }
+      }
+      for (const graceVoiceEntry of graceVoiceEntriesAfterMainNote) {
+        const mainStaffEntry: SourceStaffEntry = lastMainVoiceEntries[graceVoiceEntry.ParentVoice.VoiceId]?.ParentSourceStaffEntry;
+        if (!mainStaffEntry) {
+          continue; // no main note of this voice in the measure: leave the grace note where it is
+        }
+        graceVoiceEntry.GraceAfterMainNote = true;
+        const graceStaffEntry: SourceStaffEntry = graceVoiceEntry.ParentSourceStaffEntry;
+        if (graceStaffEntry !== mainStaffEntry) {
+          graceStaffEntry.VoiceEntries.splice(graceStaffEntry.VoiceEntries.indexOf(graceVoiceEntry), 1);
+          graceVoiceEntry.ParentSourceStaffEntry = mainStaffEntry; // also re-parents its notes
+          graceVoiceEntry.Timestamp = mainStaffEntry.Timestamp.clone();
+          mainStaffEntry.VoiceEntries.push(graceVoiceEntry); // after the main note and its grace notes before it
+        }
+      }
+    }
+  }
+
+  private getStemDirectionAndColors(xmlNode: IXmlElement): [StemDirectionType, string, string] {
+    let stemDirectionXml: StemDirectionType = StemDirectionType.Undefined;
+    let stemColorXml: string;
+    const stemNode: IXmlElement = xmlNode.element("stem");
+    if (stemNode) {
+      stemDirectionXml = this.getStemDirectionType(stemNode);
+
+      const stemColorAttr: Attr = stemNode.attribute("color");
+      if (stemColorAttr) { // can be null, maybe also undefined
+        stemColorXml = this.parseXmlColor(stemColorAttr.value);
+      }
+    }
+
+    // check notehead/color
+    let noteheadColorXml: string = this.getNoteHeadColorXml(xmlNode);
+    const noteColorXml: string = this.getNoteColorXml(xmlNode);
+
+    if (noteColorXml && !noteheadColorXml) {
+      noteheadColorXml = noteColorXml;
+    }
+    if (noteColorXml && !stemColorXml) {
+      stemColorXml = noteColorXml;
+    }
+    return [stemDirectionXml, stemColorXml, noteheadColorXml];
+  }
+
+  /** Parse a color in XML format. Can be #ARGB or #RGB format, colors as byte hex values.
+   *  @return color in Vexflow format #[A]RGB or undefined for invalid xmlColorString
+   */
+  public parseXmlColor(xmlColorString: string): string {
+    return xmlColorString;
+    // previous implementation:
+    // if (!xmlColorString) {
+    //   return undefined;
+    // }
+
+    // if (xmlColorString.length === 7) { // #RGB
+    //   return xmlColorString;
+    // } else if (xmlColorString.length === 9) { // #ARGB
+    //   return "#" + xmlColorString.substr(3); // cut away alpha channel // why?
+    // } else {
+    //   return undefined; // invalid xml color
+    // }
+  }
+
+  public doCalculationsAfterDurationHasBeenSet(): void {
+    for (const j in this.voiceGeneratorsDict) {
+      if (this.voiceGeneratorsDict.hasOwnProperty(j)) {
+        this.voiceGeneratorsDict[j].checkOpenTies();
+      }
+    }
+  }
+
+  /** Keep a key at the actual measure end for the following measure, including pickups. */
+  public finalizeKeyInstructions(): void {
+    // A forward can extend beyond the last note; the other parts can also extend this measure.
+    const end: Fraction = Fraction.max(this.currentMeasure.Duration, this.measureEndFraction);
+    for (let staffIndex: number = 0; staffIndex < this.instrument.Staves.length; staffIndex++) {
+      const globalIndex: number = this.inSourceMeasureInstrumentIndex + staffIndex;
+      let activeKey: number = this.currentMeasure.getKeyInstruction(globalIndex)?.Key ?? this.keyAtMeasureStart[staffIndex];
+      for (const entry of this.currentMeasure.getEntriesPerStaff(globalIndex)) {
+        for (const instruction of entry.Instructions.slice()) {
+          if (instruction instanceof KeyInstruction) {
+            // Entries are ordered by musical time, unlike attributes serialized after a backup.
+            if (instruction.Key === activeKey) {
+              entry.Instructions.splice(entry.Instructions.indexOf(instruction), 1);
+              continue;
+            }
+            activeKey = instruction.Key;
+            this.activeKeys[staffIndex] = instruction;
+            if (entry.Timestamp.Equals(end)) {
+              this.pendingEndKeys[staffIndex] = instruction;
+              entry.Instructions.splice(entry.Instructions.indexOf(instruction), 1);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Get or create the passing [[VoiceGenerator]].
+   * @param voiceId
+   * @param staffId
+   * @returns {VoiceGenerator}
+   */
+  private getOrCreateVoiceGenerator(voiceId: number, staffId: number): VoiceGenerator {
+    const staff: Staff = this.instrument.Staves[staffId];
+    let voiceGenerator: VoiceGenerator = this.voiceGeneratorsDict[voiceId];
+    if (voiceGenerator) {
+      if (staff.Voices.indexOf(voiceGenerator.GetVoice) === -1) {
+        staff.Voices.push(voiceGenerator.GetVoice);
+      }
+    } else {
+      const mainVoiceGenerator: VoiceGenerator = this.staffMainVoiceGeneratorDict[staffId];
+      if (mainVoiceGenerator) {
+        voiceGenerator = new VoiceGenerator(this.pluginManager, staff, voiceId, this.slurReader, mainVoiceGenerator.GetVoice);
+        staff.Voices.push(voiceGenerator.GetVoice);
+        this.voiceGeneratorsDict[voiceId] = voiceGenerator;
+      } else {
+        voiceGenerator = new VoiceGenerator(this.pluginManager, staff, voiceId, this.slurReader);
+        staff.Voices.push(voiceGenerator.GetVoice);
+        this.voiceGeneratorsDict[voiceId] = voiceGenerator;
+        this.staffMainVoiceGeneratorDict[staffId] = voiceGenerator;
+      }
+    }
+    return voiceGenerator;
+  }
+
+
+  private createExpressionGenerators(numberOfStaves: number): void {
+     this.expressionReaders = new Array(numberOfStaves);
+     for (let i: number = 0; i < numberOfStaves; i++) {
+      this.expressionReaders[i] = new ExpressionReader(this.musicSheet, this.instrument, i + 1);
+     }
+  }
+
+  /**
+   * Create the default [[ClefInstruction]] for the given staff index.
+   * @param staffIndex
+   */
+  private createDefaultClefInstruction(staffIndex: number): void {
+    let first: SourceMeasure;
+    if (this.musicSheet.SourceMeasures.length > 0) {
+      first = this.musicSheet.SourceMeasures[0];
+    } else {
+      first = this.currentMeasure;
+    }
+    const clefInstruction: ClefInstruction = new ClefInstruction(ClefEnum.G, 0, 2);
+    let firstStaffEntry: SourceStaffEntry;
+    if (!first.FirstInstructionsStaffEntries[staffIndex]) {
+      firstStaffEntry = new SourceStaffEntry(undefined, undefined);
+      first.FirstInstructionsStaffEntries[staffIndex] = firstStaffEntry;
+    } else {
+      firstStaffEntry = first.FirstInstructionsStaffEntries[staffIndex];
+      firstStaffEntry.removeFirstInstructionOfTypeClefInstruction();
+    }
+    clefInstruction.Parent = firstStaffEntry;
+    firstStaffEntry.Instructions.splice(0, 0, clefInstruction);
+  }
+
+  /**
+   * Create the default key for one staff without overwriting the other staves.
+   */
+  private createDefaultKeyInstruction(staffIndex: number): void {
+    let first: SourceMeasure;
+    if (this.musicSheet.SourceMeasures.length > 0) {
+      first = this.musicSheet.SourceMeasures[0];
+    } else {
+      first = this.currentMeasure;
+    }
+    const keyInstruction: KeyInstruction = new KeyInstruction(undefined, 0, KeyEnum.major);
+    this.storeInitialKeyInstruction(first, staffIndex, keyInstruction);
+    this.activeKeys[staffIndex] = keyInstruction;
+  }
+
+  private storeInitialKeyInstruction(measure: SourceMeasure, staffIndex: number, key: KeyInstruction): void {
+    const globalIndex: number = this.inSourceMeasureInstrumentIndex + staffIndex;
+    let entry: SourceStaffEntry = measure.FirstInstructionsStaffEntries[globalIndex];
+    if (!entry) {
+      entry = new SourceStaffEntry(undefined, undefined);
+      measure.FirstInstructionsStaffEntries[globalIndex] = entry;
+    }
+    entry.removeFirstInstructionOfTypeKeyInstruction();
+    key.Parent = entry;
+    const position: number = entry.Instructions[0] instanceof ClefInstruction ? 1 : 0;
+    entry.Instructions.splice(position, 0, key);
+  }
+
+  /** Measure-repeat lengths supported by the renderer. */
+  private static readonly SUPPORTED_MEASURE_REPEAT_LENGTHS: number[] = [1, 2, 4];
+
+  /** Reads measure-repeat declarations into their target staff entries. */
+  private readMeasureRepeats(attributesNode: IXmlElement): void {
+    for (const measureStyleNode of attributesNode.elements("measure-style")) {
+      const measureRepeatNode: IXmlElement = measureStyleNode.element("measure-repeat");
+      if (!measureRepeatNode) {
+        continue;
+      }
+      // An omitted number applies to every staff in the part.
+      let staffNumber: number;
+      let staffNumberValid: boolean = true;
+      const numberAttr: IXmlAttribute = measureStyleNode.attribute("number");
+      if (numberAttr) {
+        staffNumber = parseInt(numberAttr.value, 10);
+        staffNumberValid = !isNaN(staffNumber) && staffNumber >= 1 && staffNumber <= this.instrument.Staves.length;
+      }
+
+      let type: MeasureRepeatType = MeasureRepeatType.Invalid;
+      let measures: number = 0;
+      let slashes: number = 1;
+      const typeAttr: string = measureRepeatNode.attribute("type")?.value;
+      if (staffNumberValid) {
+        if (typeAttr === "stop") {
+          type = MeasureRepeatType.Stop;
+        } else if (typeAttr === "start") {
+          // Accept only renderer-supported repeat lengths.
+          measures = parseInt(measureRepeatNode.value, 10);
+          if (!isNaN(measures) && InstrumentReader.SUPPORTED_MEASURE_REPEAT_LENGTHS.includes(measures)) {
+            type = MeasureRepeatType.Start;
+            const slashesAttr: IXmlAttribute = measureRepeatNode.attribute("slashes");
+            if (slashesAttr) {
+              const slashesValue: number = parseInt(slashesAttr.value, 10);
+              slashes = !isNaN(slashesValue) && slashesValue >= 1 ? slashesValue : 1;
+            }
+          } else {
+            measures = 0;
+          }
+        }
+      }
+      const instruction: MeasureRepeatInstruction = new MeasureRepeatInstruction(type, measures, slashes);
+
+      for (let staffIndex: number = 0; staffIndex < this.instrument.Staves.length; staffIndex++) {
+        if (staffNumberValid && staffNumber !== undefined && staffIndex !== staffNumber - 1) {
+          continue;
+        }
+        const globalStaffIndex: number = this.inSourceMeasureInstrumentIndex + staffIndex;
+        const declarations: MeasureRepeatInstruction[] = this.currentMeasure.MeasureRepeatInstructions.get(globalStaffIndex) ?? [];
+        declarations.push(instruction);
+        this.currentMeasure.MeasureRepeatInstructions.set(globalStaffIndex, declarations);
+      }
+    }
+  }
+
+  /**
+   * Check if the given attributesNode is at the begin of a XmlMeasure.
+   * @param parentNode
+   * @param attributesNode
+   * @returns {boolean}
+   */
+  private isAttributesNodeAtBeginOfMeasure(parentNode: IXmlElement, attributesNode: IXmlElement): boolean {
+    const children: IXmlElement[] = parentNode.elements();
+    const attributesNodeIndex: number = children.indexOf(attributesNode); // FIXME | 0
+    if (attributesNodeIndex > 0 && children[attributesNodeIndex - 1].name === "backup") {
+      return true;
+    }
+    let firstNoteNodeIndex: number = -1;
+    for (let i: number = 0; i < children.length; i++) {
+      if (children[i].name === "note") {
+        firstNoteNodeIndex = i;
+        break;
+      }
+    }
+    return (attributesNodeIndex < firstNoteNodeIndex && firstNoteNodeIndex > 0) || (firstNoteNodeIndex < 0);
+  }
+
+  /**
+   * Check if the given attributesNode is at the end of a XmlMeasure.
+   * @param parentNode
+   * @param attributesNode
+   * @returns {boolean}
+   */
+  private isAttributesNodeAtEndOfMeasure(parentNode: IXmlElement, attributesNode: IXmlElement, currentFraction: Fraction): boolean {
+    if (currentFraction.Equals(this.ActiveRhythm?.Rhythm)) {
+      return true;
+      // when the MusicXML uses a lot of <backup> nodes (e.g. Sibelius), we sometimes only detect measure end like this, not like below.
+      //   because below code assumes the attributes node is the last one in the measure, just by order in the XML,
+      //   (at least that there are no note nodes after the attributes node)
+      //   but with backup nodes, there can be note nodes after it that are at an earlier timestamp.
+    }
+    const childs: IXmlElement[] = parentNode.elements().slice(); // slice=arrayCopy
+    let attributesNodeIndex: number = 0;
+    for (let i: number = 0; i < childs.length; i++) {
+      if (childs[i] === attributesNode) {
+        attributesNodeIndex = i;
+        break;
+      }
+    }
+    let nextNoteNodeIndex: number = 0;
+    for (let i: number = attributesNodeIndex; i < childs.length; i++) {
+      if (childs[i].name === "note") {
+        nextNoteNodeIndex = i;
+        break;
+      }
+    }
+    return attributesNodeIndex > nextNoteNodeIndex;
+  }
+
+  /**
+   * Called only when no noteDuration is given in XML.
+   * @param xmlNode
+   * @returns {Fraction}
+   */
+  private getNoteDurationFromTypeNode(xmlNode: IXmlElement): Fraction {
+    const typeNode: IXmlElement = xmlNode.element("type");
+    if (typeNode) {
+      const type: string = typeNode.value;
+      return NoteTypeHandler.getNoteDurationFromType(type);
+    }
+    return new Fraction(0, 4 * this.divisions);
+  }
+
+  /**
+   * Add (the three basic) Notation Instructions to a list
+   * @param attrNode
+   * @param guitarPro
+   */
+  private addAbstractInstruction(attrNode: IXmlElement, guitarPro: boolean, previousNode: IXmlElement, currentFraction: Fraction): void {
+    if (attrNode.element("divisions")) {
+      if (attrNode.elements().length === 1) {
+        return;
+      }
+    }
+    const transposeNode: IXmlElement = attrNode.element("transpose");
+    if (transposeNode) {
+      // MusicXML: sounding pitch = written pitch + chromatic + 12 * octave-change.
+      // E.g. Bb clarinet: chromatic -2. Bb tenor sax: chromatic -2, octave-change -1.
+      const chromaticNode: IXmlElement = transposeNode.element("chromatic");
+      const octaveChangeNode: IXmlElement = transposeNode.element("octave-change");
+      const chromatic: number = chromaticNode ? parseInt(chromaticNode.value, 10) : NaN;
+      const octaveChange: number = octaveChangeNode ? parseInt(octaveChangeNode.value, 10) : NaN;
+      if (!isNaN(chromatic) || !isNaN(octaveChange)) {
+        this.instrument.PlaybackTranspose =
+          (isNaN(chromatic) ? 0 : chromatic) + 12 * (isNaN(octaveChange) ? 0 : octaveChange);
+      }
+    }
+    const clefList: IXmlElement[] = attrNode.elements("clef");
+    let errorMsg: string;
+    if (clefList.length > 0) {
+      for (let idx: number = 0, len: number = clefList.length; idx < len; ++idx) {
+        const nodeList: IXmlElement = clefList[idx];
+        let clefEnum: ClefEnum = ClefEnum.G;
+        let line: number = 2;
+        let staffNumber: number = 1;
+        let clefOctaveOffset: number = 0;
+        const lineNode: IXmlElement = nodeList.element("line");
+        if (lineNode) {
+          try {
+            line = parseInt(lineNode.value, 10);
+          } catch (ex) {
+            errorMsg = ITextTranslation.translateText(
+              "ReaderErrorMessages/ClefLineError",
+              "Invalid clef line. Using default."
+            );
+            this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+            line = 2;
+            log.debug("InstrumentReader.addAbstractInstruction", errorMsg, ex);
+          }
+
+        }
+        const signNode: IXmlElement = nodeList.element("sign");
+        if (signNode) {
+          try {
+            clefEnum = ClefEnum[signNode.value];
+            if (!ClefInstruction.isSupportedClef(clefEnum)) {
+              errorMsg = ITextTranslation.translateText(
+                "ReaderErrorMessages/ClefError",
+                "Unsupported clef. Using default."
+              );
+              this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+              clefEnum = ClefEnum.G;
+              line = 2;
+            }
+            if (clefEnum === ClefEnum.TAB) {
+              clefOctaveOffset = -1;
+            }
+          } catch (e) {
+            errorMsg = ITextTranslation.translateText(
+              "ReaderErrorMessages/ClefError",
+              "Invalid clef. Using default."
+            );
+            this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+            clefEnum = ClefEnum.G;
+            line = 2;
+            log.debug("InstrumentReader.addAbstractInstruction", errorMsg, e);
+          }
+
+        }
+        const clefOctaveNode: IXmlElement = nodeList.element("clef-octave-change");
+        if (clefOctaveNode) {
+          try {
+            clefOctaveOffset = parseInt(clefOctaveNode.value, 10);
+          } catch (e) {
+            errorMsg = ITextTranslation.translateText(
+              "ReaderErrorMessages/ClefOctaveError",
+              "Invalid clef octave. Using default."
+            );
+            this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+            clefOctaveOffset = 0;
+          }
+
+        }
+        if (nodeList.hasAttributes && nodeList.attribute("number")) {
+          try {
+            staffNumber = parseInt(nodeList.attribute("number").value, 10);
+            if (staffNumber > this.currentClefNumber) {
+              staffNumber = this.currentClefNumber;
+            }
+            this.currentClefNumber = staffNumber + 1;
+          } catch (err) {
+            errorMsg = ITextTranslation.translateText(
+              "ReaderErrorMessages/ClefError",
+              "Invalid clef. Using default."
+            );
+            this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+            staffNumber = 1;
+            this.currentClefNumber = staffNumber + 1;
+          }
+        }
+
+        const clefInstruction: ClefInstruction = new ClefInstruction(clefEnum, clefOctaveOffset, line);
+        this.abstractInstructions.push([staffNumber, clefInstruction, currentFraction]);
+      }
+    }
+    for (const keyElement of attrNode.elements("key")) {
+      if (this.instrument.MidiInstrumentId === MidiInstrument.Percussion) {
+        continue;
+      }
+      const staffNumber: number = parseInt(keyElement.attribute("number")?.value, 10);
+      let key: number = 0;
+      const keyNode: IXmlElement = keyElement.element("fifths");
+      if (keyNode) {
+        try {
+          key = parseInt(keyNode.value, 10);
+        } catch (ex) {
+          errorMsg = ITextTranslation.translateText(
+            "ReaderErrorMessages/KeyError",
+            "Invalid key. Set to default."
+          );
+          this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+          key = 0;
+          log.debug("InstrumentReader.addAbstractInstruction", errorMsg, ex);
+        }
+
+      }
+      let keyEnum: KeyEnum = KeyEnum.none;
+      const modeNode: IXmlElement = keyElement.element("mode");
+      if (modeNode) {
+        try {
+          keyEnum = KeyEnum[modeNode.value];
+        } catch (ex) {
+          errorMsg = ITextTranslation.translateText(
+            "ReaderErrorMessages/KeyError",
+            "Invalid key/mode. Set to default."
+          );
+          this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+          keyEnum = KeyEnum.major;
+          log.debug("InstrumentReader.addAbstractInstruction", errorMsg, ex);
+        }
+      }
+      for (let staffIndex: number = 0; staffIndex < this.instrument.Staves.length; staffIndex++) {
+        // A numbered key applies only to its staff, an unnumbered or invalid one to all staves.
+        if (staffNumber >= 1 && staffNumber <= this.instrument.Staves.length && staffNumber !== staffIndex + 1) {
+          continue;
+        }
+        const keyInstruction: KeyInstruction = new KeyInstruction(undefined, key, keyEnum);
+        if (currentFraction.RealValue > 0) {
+          if (!this.activeKeysHaveBeenInitialized[staffIndex]) {
+            this.createDefaultKeyInstruction(staffIndex);
+            this.activeKeysHaveBeenInitialized[staffIndex] = true;
+          }
+          const entry: SourceStaffEntry = this.currentMeasure.findOrCreateStaffEntry(
+            currentFraction, this.inSourceMeasureInstrumentIndex + staffIndex, this.instrument.Staves[staffIndex]
+          ).staffEntry;
+          keyInstruction.Parent = entry;
+          entry.Instructions.push(keyInstruction);
+        } else {
+          this.abstractInstructions.push([staffIndex + 1, keyInstruction, currentFraction]);
+        }
+      }
+    }
+    if (attrNode.element("time")) {
+      const timeNode: IXmlElement = attrNode.element("time");
+      let symbolEnum: RhythmSymbolEnum = RhythmSymbolEnum.NONE;
+      let timePrintObject: boolean = true;
+      if (timeNode !== undefined && timeNode.hasAttributes) {
+        const symbolAttribute: IXmlAttribute = timeNode.attribute("symbol");
+        if (symbolAttribute) {
+          if (symbolAttribute.value === "common") {
+            symbolEnum = RhythmSymbolEnum.COMMON;
+          } else if (symbolAttribute.value === "cut") {
+            symbolEnum = RhythmSymbolEnum.CUT;
+          }
+        }
+
+        const printObjectAttribute: IXmlAttribute = timeNode.attribute("print-object");
+        if (printObjectAttribute) {
+          if (printObjectAttribute.value === "no") {
+            timePrintObject = false;
+          }
+        }
+      }
+
+      let num: number = 0;
+      let denom: number = 0;
+      const senzaMisura: boolean = (timeNode && timeNode.element("senza-misura") !== undefined);
+      const timeList: IXmlElement[] = attrNode.elements("time");
+      const beatsList: IXmlElement[] = [];
+      const typeList: IXmlElement[] = [];
+      for (let idx: number = 0, len: number = timeList.length; idx < len; ++idx) {
+        const xmlNode: IXmlElement = timeList[idx];
+        beatsList.push(...xmlNode.elements("beats"));
+        typeList.push(...xmlNode.elements("beat-type"));
+      }
+      if (!senzaMisura) {
+        try {
+          if (beatsList !== undefined && beatsList.length > 0 && typeList !== undefined && beatsList.length === typeList.length) {
+            const length: number = beatsList.length;
+            const fractions: Fraction[] = new Array(length);
+            let maxDenom: number = 0;
+            for (let i: number = 0; i < length; i++) {
+              const s: string = beatsList[i].value;
+              let n: number = 0;
+              let d: number = 0;
+              if (s.indexOf("+") !== -1) {
+                const numbers: string[] = s.split("+");
+                for (let idx: number = 0, len: number = numbers.length; idx < len; ++idx) {
+                  n += parseInt(numbers[idx], 10);
+                }
+              } else {
+                n = parseInt(s, 10);
+              }
+              d = parseInt(typeList[i].value, 10);
+              maxDenom = Math.max(maxDenom, d);
+              fractions[i] = new Fraction(n, d, 0, false);
+            }
+            for (let i: number = 0; i < length; i++) {
+              if (fractions[i].Denominator === maxDenom) {
+                num += fractions[i].Numerator;
+              } else {
+                num += (maxDenom / fractions[i].Denominator) * fractions[i].Numerator;
+              }
+            }
+            denom = maxDenom;
+          } else {
+            num = parseInt(attrNode.element("time").element("beats").value, 10);
+            denom = parseInt(attrNode.element("time").element("beat-type").value, 10);
+          }
+        } catch (ex) {
+          errorMsg = ITextTranslation.translateText("ReaderErrorMessages/RhythmError", "Invalid rhythm. Set to default.");
+          this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+          num = 4;
+          denom = 4;
+          log.debug("InstrumentReader.addAbstractInstruction", errorMsg, ex);
+        }
+
+        const newRhythmInstruction: RhythmInstruction = new RhythmInstruction(
+          new Fraction(num, denom, 0, false), symbolEnum
+        );
+        newRhythmInstruction.PrintObject = timePrintObject;
+        this.abstractInstructions.push([1, newRhythmInstruction, currentFraction]);
+      } else {
+        this.abstractInstructions.push([1, new RhythmInstruction(new Fraction(4, 4, 0, false), RhythmSymbolEnum.NONE), currentFraction]);
+      }
+    }
+  }
+
+  /**
+   * Save the current AbstractInstructions to the corresponding [[StaffEntry]]s.
+   * @param numberOfStaves
+   * @param beginOfMeasure
+   */
+  private saveAbstractInstructionList(numberOfStaves: number, beginOfMeasure: boolean): void {
+    // Key declarations use their MusicXML source order. The reverse pass below is retained for clef and rhythm removal.
+    for (let i: number = 0; i < this.abstractInstructions.length;) {
+      const instruction: [number, AbstractNotationInstruction, Fraction] = this.abstractInstructions[i];
+      if (!(instruction[1] instanceof KeyInstruction)) {
+        i++;
+        continue;
+      }
+      const staffIndex: number = instruction[0] - 1;
+      const keyInstruction: KeyInstruction = <KeyInstruction>instruction[1];
+      if (!this.activeKeys[staffIndex] || this.activeKeys[staffIndex].Key !== keyInstruction.Key) {
+        this.activeKeys[staffIndex] = keyInstruction;
+        let sourceMeasure: SourceMeasure = this.currentMeasure;
+        if (!this.activeKeysHaveBeenInitialized[staffIndex]) {
+          this.activeKeysHaveBeenInitialized[staffIndex] = true;
+          if (this.currentXmlMeasureIndex > 0) {
+            sourceMeasure = this.musicSheet.SourceMeasures[0];
+          }
+        }
+        if (sourceMeasure) {
+          this.storeInitialKeyInstruction(sourceMeasure, staffIndex, keyInstruction);
+        }
+      }
+      this.abstractInstructions.splice(i, 1);
+    }
+    for (let i: number = this.abstractInstructions.length - 1; i >= 0; i--) {
+      const instruction: [number, AbstractNotationInstruction, Fraction] = this.abstractInstructions[i];
+      const key: number = instruction[0]; // staffNumber
+      const value: AbstractNotationInstruction = instruction[1];
+      const instructionTimestamp: Fraction = instruction[2];
+      if (value instanceof ClefInstruction) {
+        const clefInstruction: ClefInstruction = <ClefInstruction>value;
+        if (this.currentXmlMeasureIndex === 0 || (key <= this.activeClefs.length && clefInstruction !== this.activeClefs[key - 1])) {
+          if (!beginOfMeasure && this.currentStaffEntry !== undefined && !this.currentStaffEntry.hasNotes() &&
+            key - 1 === this.instrument.Staves.indexOf(this.currentStaffEntry.ParentStaff)) {
+            const newClefInstruction: ClefInstruction = clefInstruction;
+            const staffEntry: SourceStaffEntry = this.currentStaffEntry;
+            // the instructionTimestamp may differ from the current staffentry's when backup/forward tags are used in the XML.
+            //   in this case, we need to skip placing it at the current entry, and save it for later.
+            if (instructionTimestamp && Math.abs(instructionTimestamp.RealValue - staffEntry.Timestamp.RealValue) > 0.01) {
+              continue; // this instruction should be at a different staffentry/timestamp.
+            }
+            newClefInstruction.Parent = staffEntry;
+            staffEntry.removeFirstInstructionOfTypeClefInstruction();
+            staffEntry.Instructions.push(newClefInstruction);
+            this.activeClefs[key - 1] = clefInstruction;
+            this.abstractInstructions.splice(i, 1);
+          } else if (beginOfMeasure) {
+            if (instructionTimestamp.RealValue !== 0) {
+              continue;
+            }
+            let firstStaffEntry: SourceStaffEntry;
+            if (this.currentMeasure) {
+              const newClefInstruction: ClefInstruction = clefInstruction;
+              const sseIndex: number = this.inSourceMeasureInstrumentIndex + key - 1;
+              const firstSse: SourceStaffEntry = this.currentMeasure.FirstInstructionsStaffEntries[sseIndex];
+              if (this.currentXmlMeasureIndex === 0) {
+                if (!firstSse) {
+                  firstStaffEntry = new SourceStaffEntry(undefined, undefined);
+                  this.currentMeasure.FirstInstructionsStaffEntries[sseIndex] = firstStaffEntry;
+                  newClefInstruction.Parent = firstStaffEntry;
+                  firstStaffEntry.Instructions.push(newClefInstruction);
+                  this.activeClefsHaveBeenInitialized[key - 1] = true;
+                } else if (this.currentMeasure.FirstInstructionsStaffEntries[sseIndex]
+                  !==
+                  undefined && !(firstSse.Instructions[0] instanceof ClefInstruction)) {
+                  firstStaffEntry = firstSse;
+                  newClefInstruction.Parent = firstStaffEntry;
+                  firstStaffEntry.removeFirstInstructionOfTypeClefInstruction();
+                  firstStaffEntry.Instructions.splice(0, 0, newClefInstruction);
+                  this.activeClefsHaveBeenInitialized[key - 1] = true;
+                } else {
+                  const lastStaffEntry: SourceStaffEntry = new SourceStaffEntry(undefined, undefined);
+                  this.currentMeasure.LastInstructionsStaffEntries[sseIndex] = lastStaffEntry;
+                  newClefInstruction.Parent = lastStaffEntry;
+                  lastStaffEntry.Instructions.push(newClefInstruction);
+                }
+              } else if (!this.activeClefsHaveBeenInitialized[key - 1]) {
+                const first: SourceMeasure = this.musicSheet.SourceMeasures[0];
+                if (!first.FirstInstructionsStaffEntries[sseIndex]) {
+                  firstStaffEntry = new SourceStaffEntry(undefined, undefined);
+                } else {
+                  firstStaffEntry = first.FirstInstructionsStaffEntries[sseIndex];
+                  firstStaffEntry.removeFirstInstructionOfTypeClefInstruction();
+                }
+                newClefInstruction.Parent = firstStaffEntry;
+                firstStaffEntry.Instructions.splice(0, 0, newClefInstruction);
+                this.activeClefsHaveBeenInitialized[key - 1] = true;
+              } else {
+                let previousPrintedMeasure: SourceMeasure = this.previousMeasure;
+                if (this.followingMultirestMeasures > 0 && this.currentMeasure.Rules.RenderMultipleRestMeasures) {
+                  previousPrintedMeasure = this.currentMultirestStartMeasure;
+                  // TODO check if we can do the same for autogenerated multirest measures
+                }
+                const lastStaffEntry: SourceStaffEntry = new SourceStaffEntry(undefined, undefined);
+                previousPrintedMeasure.LastInstructionsStaffEntries[sseIndex] = lastStaffEntry;
+                newClefInstruction.Parent = lastStaffEntry;
+                lastStaffEntry.Instructions.push(newClefInstruction);
+              }
+              this.activeClefs[key - 1] = clefInstruction;
+              this.abstractInstructions.splice(i, 1);
+            }
+          }
+          // else the clef stays in the list: the staff entry at its timestamp may only come later in the measure (e.g. in a
+          //   voice after a <backup>), or never, and then savePendingClefInstructions() places it at the end of the measure.
+        } else if (key <= this.activeClefs.length && clefInstruction === this.activeClefs[key - 1]) {
+          this.abstractInstructions.splice(i, 1);
+        }
+      }
+      if (value instanceof RhythmInstruction) {
+        const rhythmInstruction: RhythmInstruction = <RhythmInstruction>value;
+        if (!this.activeRhythm || this.activeRhythm !== rhythmInstruction) {
+          this.activeRhythm = rhythmInstruction;
+          this.abstractInstructions.splice(i, 1);
+          if (this.currentMeasure) {
+            for (let j: number = this.inSourceMeasureInstrumentIndex; j < this.inSourceMeasureInstrumentIndex + numberOfStaves; j++) {
+              const newRhythmInstruction: RhythmInstruction = rhythmInstruction;
+              let firstStaffEntry: SourceStaffEntry;
+              if (!this.currentMeasure.FirstInstructionsStaffEntries[j]) {
+                firstStaffEntry = new SourceStaffEntry(undefined, undefined);
+                this.currentMeasure.FirstInstructionsStaffEntries[j] = firstStaffEntry;
+              } else {
+                firstStaffEntry = this.currentMeasure.FirstInstructionsStaffEntries[j];
+                firstStaffEntry.removeFirstInstructionOfTypeRhythmInstruction();
+              }
+              newRhythmInstruction.Parent = firstStaffEntry;
+              firstStaffEntry.Instructions.push(newRhythmInstruction);
+            }
+          }
+        } else {
+          this.abstractInstructions.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  /**
+   * Save any ClefInstruction given - exceptionally - at the end of the currentMeasure.
+   */
+  private saveClefInstructionAtEndOfMeasure(): void {
+    for (let i: number = this.abstractInstructions.length - 1; i >= 0; i--) {
+      const key: number = this.abstractInstructions[i][0];
+      const value: AbstractNotationInstruction = this.abstractInstructions[i][1];
+      if (value instanceof ClefInstruction) {
+        const clefInstruction: ClefInstruction = <ClefInstruction>value;
+        if (
+          (!this.activeClefs[key - 1]) ||
+          (clefInstruction.ClefType !== this.activeClefs[key - 1].ClefType || (
+            clefInstruction.ClefType === this.activeClefs[key - 1].ClefType &&
+            clefInstruction.Line !== this.activeClefs[key - 1].Line
+          ))) {
+          const lastStaffEntry: SourceStaffEntry = new SourceStaffEntry(undefined, undefined);
+          this.currentMeasure.LastInstructionsStaffEntries[this.inSourceMeasureInstrumentIndex + key - 1] = lastStaffEntry;
+          const newClefInstruction: ClefInstruction = clefInstruction;
+          newClefInstruction.Parent = lastStaffEntry;
+          lastStaffEntry.Instructions.push(newClefInstruction);
+          this.activeClefs[key - 1] = clefInstruction;
+          this.abstractInstructions.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  /**
+   * Saves the clefs that saveAbstractInstructionList() left in the list, at the end of the measure, when all its staff entries
+   * exist. A clef in the middle of a measure goes to the staff entry of its staff at its timestamp, but the staff may have no
+   * note starting there: e.g. the next note of the clef's voice is on another staff (#1836), or the clef follows a `<backup>`
+   * to a time in the middle of a note. Such a clef goes before the next note of its staff, so that it applies from there on,
+   * or to the end of the measure if no note of its staff follows. These clefs were lost before, so their staff kept its clef.
+   */
+  private savePendingClefInstructions(): void {
+    for (let i: number = this.abstractInstructions.length - 1; i >= 0; i--) {
+      const staffNumber: number = this.abstractInstructions[i][0];
+      const clefInstruction: AbstractNotationInstruction = this.abstractInstructions[i][1];
+      const clefTimestamp: Fraction = this.abstractInstructions[i][2];
+      if (!(clefInstruction instanceof ClefInstruction) || staffNumber > this.instrument.Staves.length) {
+        continue;
+      }
+      this.abstractInstructions.splice(i, 1);
+      const staffIndex: number = this.inSourceMeasureInstrumentIndex + staffNumber - 1;
+      let nextStaffEntry: SourceStaffEntry;
+      for (const container of this.currentMeasure.VerticalSourceStaffEntryContainers) { // in timestamp order
+        if (container.Timestamp.gte(clefTimestamp) && container.StaffEntries[staffIndex]?.hasNotes()) {
+          nextStaffEntry = container.StaffEntries[staffIndex];
+          break;
+        }
+      }
+      let staffEntry: SourceStaffEntry = nextStaffEntry ?? this.currentMeasure.LastInstructionsStaffEntries[staffIndex];
+      if (staffEntry?.Instructions.some((instruction: AbstractNotationInstruction): boolean => instruction instanceof ClefInstruction)) {
+        continue; // a later clef change is there already
+      }
+      if (!nextStaffEntry) {
+        const activeClef: ClefInstruction = this.activeClefs[staffNumber - 1];
+        if (activeClef?.ClefType === clefInstruction.ClefType && activeClef.Line === clefInstruction.Line &&
+          activeClef.OctaveOffset === clefInstruction.OctaveOffset) {
+          continue; // no clef change, which would be drawn at the end of the measure (see saveClefInstructionAtEndOfMeasure())
+        }
+        if (!staffEntry) {
+          staffEntry = new SourceStaffEntry(undefined, undefined);
+          this.currentMeasure.LastInstructionsStaffEntries[staffIndex] = staffEntry;
+        }
+      }
+      clefInstruction.Parent = staffEntry;
+      staffEntry.Instructions.push(clefInstruction);
+      this.activeClefs[staffNumber - 1] = clefInstruction;
+    }
+  }
+
+  /**
+   * Compute a tuplet note's real (sounding) duration.
+   *
+   * Per the MusicXML spec a note's <duration> already reflects the tuplet ratio, so we normally take it
+   * verbatim. Doing so also preserves an exporter's rounding when the divisions value can't encode the
+   * exact tuplet fraction (e.g. a triplet eighth when divisions isn't divisible by 3).
+   *
+   * Some exporters (observed: musx2mxl 0.2.9) instead write the *un-reduced* type duration for tuplet
+   * notes — a triplet eighth carries the <duration> of a full eighth — which overflows the measure and
+   * makes OSMD play and space the notes as if they weren't a tuplet. We detect that (the written
+   * duration equals the note's dotted type duration instead of the smaller reduced value) and apply the
+   * time-modification ratio (normal-notes / actual-notes) ourselves. When this heuristic would misfire
+   * on an already-correct note the ratio is necessarily ~1, so the correction is then a no-op.
+   * @param xmlNode
+   * @returns {Fraction}
+   */
+  private getNoteDurationForTuplet(xmlNode: IXmlElement): Fraction {
+    const durationNode: IXmlElement = xmlNode.element("duration");
+    const durationValue: number = Number.parseInt(durationNode.value, 10);
+    const xmlDuration: Fraction = new Fraction(durationValue, this.divisions * 4);
+
+    const timeModNode: IXmlElement = xmlNode.element("time-modification");
+    const actualNotesNode: IXmlElement = timeModNode?.element("actual-notes");
+    const normalNotesNode: IXmlElement = timeModNode?.element("normal-notes");
+    if (actualNotesNode && normalNotesNode) {
+      const actualNotes: number = parseInt(actualNotesNode.value, 10);
+      const normalNotes: number = parseInt(normalNotesNode.value, 10);
+      const typeDuration: Fraction = this.getDottedNoteDurationFromTypeNode(xmlNode);
+      // A correctly encoded tuplet note is shorter (or, for augmentation tuplets, longer) than its
+      // written type; only an un-reduced <duration> equals the note's dotted type duration exactly.
+      if (actualNotes > 0 && normalNotes > 0 && actualNotes !== normalNotes && typeDuration.RealValue > 0 &&
+          Math.abs(xmlDuration.RealValue - typeDuration.RealValue) < 1e-6) {
+        let ratioNumerator: number = normalNotes;
+        let ratioDenominator: number = actualNotes;
+        // a dotted normal-note reference occupies 1.5x the time; keep the ratio integer (x3 / x2 per dot)
+        const normalDots: number = timeModNode.elements("normal-dot").length;
+        for (let i: number = 0; i < normalDots; i++) {
+          ratioNumerator *= 3;
+          ratioDenominator *= 2;
+        }
+        return Fraction.multiply(xmlDuration, new Fraction(ratioNumerator, ratioDenominator));
+      }
+    }
+    return xmlDuration;
+  }
+
+  /**
+   * The note's duration derived from its <type>, including augmentation <dot>s (e.g. a dotted eighth
+   * yields 3/16, a dotted whole note 3/2). Returns a zero Fraction when no <type> is given.
+   * @param xmlNode
+   * @returns {Fraction}
+   */
+  private getDottedNoteDurationFromTypeNode(xmlNode: IXmlElement): Fraction {
+    const typeDuration: Fraction = this.getNoteDurationFromTypeNode(xmlNode);
+    const dots: number = xmlNode.elements("dot").length;
+    let addition: Fraction = typeDuration.clone();
+    for (let i: number = 0; i < dots; i++) {
+      // each dot adds half of the previous addition. Fraction.multiply() includes the whole part (WholeValue),
+      //   which Numerator leaves out (a whole note is 1 + 0/1).
+      addition = Fraction.multiply(addition, new Fraction(1, 2));
+      typeDuration.Add(addition);
+    }
+    return typeDuration;
+  }
+
+  private readExpressionStaffNumber(xmlNode: IXmlElement): number {
+   let directionStaffNumber: number = 1;
+   if (xmlNode.element("staff")) {
+     const staffNode: IXmlElement = xmlNode.element("staff");
+     if (staffNode) {
+       try {
+         directionStaffNumber = parseInt(staffNode.value, 10);
+       } catch (ex) {
+         const errorMsg: string = ITextTranslation.translateText(
+           "ReaderErrorMessages/ExpressionStaffError", "Invalid Expression staff number. Set to default."
+         );
+         this.musicSheet.SheetErrors.pushMeasureError(errorMsg);
+         directionStaffNumber = 1;
+         log.debug("InstrumentReader.readExpressionStaffNumber", errorMsg, ex);
+       }
+
+     }
+   }
+   return directionStaffNumber;
+  }
+
+  /**
+   * Calculate the divisions value from the type and duration of the first MeasureNote that makes sense
+   * (meaning itself hasn't any errors and it doesn't belong to a [[Tuplet]]).
+   *
+   * If all the MeasureNotes belong to a [[Tuplet]], then we read the next XmlMeasure (and so on...).
+   * If we have reached the end of the [[Instrument]] and still the divisions aren't set, we throw an exception
+   * @returns {number}
+   */
+  private readDivisionsFromNotes(): number {
+    let divisionsFromNote: number = 0;
+    let xmlMeasureIndex: number = this.currentXmlMeasureIndex;
+    let read: boolean = false;
+    while (!read) {
+      const xmlMeasureListArr: IXmlElement[] = this.xmlMeasureList[xmlMeasureIndex].elements();
+      for (let idx: number = 0, len: number = xmlMeasureListArr.length; idx < len; ++idx) {
+        const xmlNode: IXmlElement = xmlMeasureListArr[idx];
+        if (xmlNode.name === "note" && !xmlNode.element("time-modification")) {
+          const durationNode: IXmlElement = xmlNode.element("duration");
+          const typeNode: IXmlElement = xmlNode.element("type");
+          if (durationNode !== undefined && typeNode) {
+            const type: string = typeNode.value;
+            let noteDuration: number = 0;
+            try {
+              noteDuration = parseInt(durationNode.value, 10);
+            } catch (ex) {
+              log.debug("InstrumentReader.readDivisionsFromNotes", ex);
+              continue;
+            }
+
+            switch (type) {
+              case "1024th":
+                divisionsFromNote = (noteDuration / 4) * 1024;
+                break;
+              case "512th":
+                divisionsFromNote = (noteDuration / 4) * 512;
+                break;
+              case "256th":
+                divisionsFromNote = (noteDuration / 4) * 256;
+                break;
+              case "128th":
+                divisionsFromNote = (noteDuration / 4) * 128;
+                break;
+              case "64th":
+                divisionsFromNote = (noteDuration / 4) * 64;
+                break;
+              case "32nd":
+                divisionsFromNote = (noteDuration / 4) * 32;
+                break;
+              case "16th":
+                divisionsFromNote = (noteDuration / 4) * 16;
+                break;
+              case "eighth":
+                divisionsFromNote = (noteDuration / 4) * 8;
+                break;
+              case "quarter":
+                divisionsFromNote = (noteDuration / 4) * 4;
+                break;
+              case "half":
+                divisionsFromNote = (noteDuration / 4) * 2;
+                break;
+              case "whole":
+                divisionsFromNote = (noteDuration / 4);
+                break;
+              case "breve":
+                divisionsFromNote = (noteDuration / 4) / 2;
+                break;
+              case "long":
+                divisionsFromNote = (noteDuration / 4) / 4;
+                break;
+              case "maxima":
+                divisionsFromNote = (noteDuration / 4) / 8;
+                break;
+              default:
+                break;
+            }
+          }
+        }
+        if (divisionsFromNote > 0) {
+          read = true;
+          break;
+        }
+      }
+      if (divisionsFromNote === 0) {
+        xmlMeasureIndex++;
+        if (xmlMeasureIndex === this.xmlMeasureList.length) {
+          const errorMsg: string = ITextTranslation.translateText("ReaderErrorMEssages/DivisionsError", "Invalid divisions value at Instrument: ");
+          throw new MusicSheetReadingException(errorMsg + this.instrument.Name);
+        }
+      }
+    }
+    return divisionsFromNote;
+  }
+
+  private getCueNoteAndNoteTypeXml(xmlNode: IXmlElement): [boolean, NoteType] {
+    const cueNode: IXmlElement = xmlNode.element("cue");
+    let isCueNote: boolean = false;
+    if (cueNode) {
+      isCueNote = true;
+    }
+
+    const typeNode: IXmlElement = xmlNode.element("type");
+    let noteTypeXml: NoteType = NoteType.UNDEFINED;
+    if (typeNode) {
+      const sizeAttr: Attr = typeNode.attribute("size");
+      if (sizeAttr?.value === "cue") {
+        isCueNote = true;
+      }
+      noteTypeXml = NoteTypeHandler.StringToNoteType(typeNode.value);
+    }
+    return [isCueNote, noteTypeXml];
+  }
+
+  private getStemDirectionType(stemNode: IXmlElement): StemDirectionType {
+    switch (stemNode.value) {
+      case "down":
+        return StemDirectionType.Down;
+      case "up":
+        return StemDirectionType.Up;
+      case "double":
+        return StemDirectionType.Double;
+      case "none":
+        return StemDirectionType.None;
+      default:
+        return StemDirectionType.Undefined;
+    }
+  }
+
+  private getNoteHeadColorXml(xmlNode: IXmlElement): string | null {
+    const noteheadNode: IXmlElement = xmlNode.element("notehead");
+    if (noteheadNode) {
+      const colorAttr: Attr = noteheadNode.attribute("color");
+      if (colorAttr) {
+        return this.parseXmlColor(colorAttr.value);
+      }
+    }
+    return null;
+  }
+
+  private getNoteColorXml(xmlNode: IXmlElement): string | null {
+    const noteColorAttr: Attr = xmlNode.attribute("color");
+    if (noteColorAttr) { // can be undefined
+      return this.parseXmlColor(noteColorAttr.value);
+    }
+    return null;
+  }
+
+  private getTremoloInfo(ornamentsNode: IXmlElement): TremoloInfo {
+    let tremoloStrokes: number;
+    let tremoloUnmeasured: boolean;
+    let tremoloBetweenNotesStart: boolean;
+    let tremoloBetweenNotesStop: boolean;
+    const tremoloNode: IXmlElement = ornamentsNode.element("tremolo");
+    if (tremoloNode) {
+      let tremoloType: string = tremoloNode.attribute("type")?.value;
+      if (!tremoloType) {
+        tremoloType = "single"; // the type attribute is optional in MusicXML and defaults to "single"
+      }
+      if (tremoloType === "single") {
+        const tremoloStrokesGiven: number = parseInt(tremoloNode.value, 10);
+        if (tremoloStrokesGiven > 0) {
+          tremoloStrokes = tremoloStrokesGiven;
+        }
+      } else {
+        tremoloStrokes = 0;
+      }
+      if (tremoloType === "unmeasured") {
+        tremoloUnmeasured = true;
+      } else if (tremoloType === "start" || tremoloType === "stop") {
+        // tremolo between (two) notes. The notes are linked in VoiceGenerator.handleTremoloBetweenNotes(),
+        //   the strokes between the notes are drawn in VexFlowMusicSheetDrawer.drawTremolosBetweenNotes().
+        tremoloBetweenNotesStart = tremoloType === "start";
+        tremoloBetweenNotesStop = tremoloType === "stop";
+        const tremoloStrokesGiven: number = parseInt(tremoloNode.value, 10);
+        if (tremoloStrokesGiven > 0) {
+          tremoloStrokes = tremoloStrokesGiven;
+        }
+      }
+    }
+    return {
+      tremoloStrokes: tremoloStrokes,
+      tremoloUnmeasured: tremoloUnmeasured,
+      tremoloBetweenNotesStart: tremoloBetweenNotesStart,
+      tremoloBetweenNotesStop: tremoloBetweenNotesStop
+    };
+  }
+
+  private getWavyLines(ornamentsNode: IXmlElement, xmlNode: IXmlElement, currentFraction: Fraction, previousFraction: Fraction): void {
+    const wavyLineNodes: IXmlElement[] = ornamentsNode.elements("wavy-line");
+    if (!wavyLineNodes) {
+      return;
+    }
+    /* As mentioned elsewhere, the wavy-line is technically an ornament element, but is specified and behaves
+        very much like a continuous expression, so makes more sense to interpret as an expression in our model.
+    */
+    for (const wavyLineNode of wavyLineNodes) {
+      const expressionReader: ExpressionReader = this.expressionReaders[this.readExpressionStaffNumber(xmlNode) - 1];
+      if (expressionReader) {
+        //Read placement from the wavy line node
+        expressionReader.readExpressionParameters(
+          wavyLineNode, this.instrument, this.divisions, currentFraction, previousFraction, this.currentMeasure.MeasureNumber, false
+        );
+        expressionReader.addWavyLine(
+          wavyLineNode, this.currentMeasure, currentFraction, previousFraction
+        );
+      }
+    }
+  }
+
+  private getNoteStaff(xmlNode: IXmlElement): number {
+    let noteStaff: number = 1;
+    if (this.instrument.Staves.length > 1) {
+      if (xmlNode.element("staff")) {
+        noteStaff = parseInt(xmlNode.element("staff").value, 10);
+        if (isNaN(noteStaff)) {
+          log.debug("InstrumentReader.readNextXmlMeasure.get staff number");
+          noteStaff = 1;
+        }
+      }
+    }
+    return noteStaff;
+  }
+}

@@ -1,0 +1,419 @@
+// [VexFlow](http://vexflow.com) - Copyright (c) Mohit Muthanna 2010.
+// Author: Larry Kuhns.
+//
+// ## Description
+//
+// This file implements articulations and accents as modifiers that can be
+// attached to notes. The complete list of articulations is available in
+// `tables.js` under `Vex.Flow.articulationCodes`.
+//
+// See `tests/articulation_tests.js` for usage examples.
+
+import { Vex } from './vex';
+import { Flow } from './tables';
+import { Modifier } from './modifier';
+import { Glyph } from './glyph';
+import { Stem } from './stem';
+import { TickContext } from './tickcontext';
+
+// To enable logging for this class. Set `Vex.Flow.Articulation.DEBUG` to `true`.
+function L(...args) { if (Articulation.DEBUG) Vex.L('Vex.Flow.Articulation', args); }
+
+const { ABOVE, BELOW } = Modifier.Position;
+
+const roundToNearestHalf = (mathFn, value) => mathFn(value / 0.5) * 0.5;
+
+// This includes both staff and ledger lines
+const isWithinLines = (line, position) => position === ABOVE ? line <= 5 : line >= 1;
+
+const getRoundingFunction = (line, position) => {
+  if (isWithinLines(line, position)) {
+    if (position === ABOVE) {
+      return Math.ceil;
+    } else {
+      return Math.floor;
+    }
+  } else {
+    return Math.round;
+  }
+};
+
+const snapLineToStaff = (canSitBetweenLines, line, position, offsetDirection) => {
+  // Initially, snap to nearest staff line or space
+  const snappedLine = roundToNearestHalf(getRoundingFunction(line, position), line);
+  const canSnapToStaffSpace = canSitBetweenLines && isWithinLines(snappedLine, position);
+  const onStaffLine = snappedLine % 1 === 0;
+
+  if (canSnapToStaffSpace && onStaffLine) {
+    const HALF_STAFF_SPACE = 0.5;
+    return snappedLine + (HALF_STAFF_SPACE * -offsetDirection);
+  } else {
+    return snappedLine;
+  }
+};
+
+const isStaveNote = (note) => {
+  const noteCategory = note.getCategory();
+  return noteCategory === 'stavenotes' || noteCategory === 'gracenotes';
+};
+
+const getTopY = (note, textLine) => {
+  const stave = note.getStave();
+  const stemDirection = note.getStemDirection();
+  const { topY: stemTipY, baseY: stemBaseY } = note.getStemExtents();
+
+  if (isStaveNote(note)) {
+    if (note.hasStem()) {
+      if (stemDirection === Stem.UP) {
+        return stemTipY;
+      } else {
+        return stemBaseY;
+      }
+    } else {
+      return Math.min(...note.getYs());
+    }
+  } else if (note.getCategory() === 'tabnotes') {
+    if (note.hasStem()) {
+      if (stemDirection === Stem.UP) {
+        return stemTipY;
+      } else {
+        return stave.getYForTopText(textLine);
+      }
+    } else {
+      return stave.getYForTopText(textLine);
+    }
+  } else {
+    throw new Vex.RERR(
+      'UnknownCategory', 'Only can get the top and bottom ys of stavenotes and tabnotes'
+    );
+  }
+};
+
+const getBottomY = (note, textLine) => {
+  const stave = note.getStave();
+  const stemDirection = note.getStemDirection();
+  const { topY: stemTipY, baseY: stemBaseY } = note.getStemExtents();
+
+  if (isStaveNote(note)) {
+    if (note.hasStem()) {
+      if (stemDirection === Stem.UP) {
+        return stemBaseY;
+      } else {
+        return stemTipY;
+      }
+    } else {
+      return Math.max(...note.getYs());
+    }
+  } else if (note.getCategory() === 'tabnotes') {
+    if (note.hasStem()) {
+      if (stemDirection === Stem.UP) {
+        return stave.getYForBottomText(textLine);
+      } else {
+        return stemTipY;
+      }
+    } else {
+      return stave.getYForBottomText(textLine);
+    }
+  } else {
+    throw new Vex.RERR(
+      'UnknownCategory', 'Only can get the top and bottom ys of stavenotes and tabnotes'
+    );
+  }
+};
+
+// Gets the initial offset of the articulation from the y value of the starting position.
+// This is required because the top/bottom text positions already have spacing applied to
+// provide a "visually pleasent" default position. However the y values provided from
+// the stavenote's top/bottom do *not* have any pre-applied spacing. This function
+// normalizes this asymmetry.
+const getInitialOffset = (note, position) => {
+  const isOnStemTip = (
+    (position === ABOVE && note.getStemDirection() === Stem.UP) ||
+    (position === BELOW && note.getStemDirection() === Stem.DOWN)
+  );
+
+  if (isStaveNote(note)) {
+    if (note.hasStem() && isOnStemTip) {
+      return 0.5;
+    } else {
+      // this amount is larger than the stem-tip offset because we start from
+      // the center of the notehead
+      return 1;
+    }
+  } else {
+    if (note.hasStem() && isOnStemTip) {
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+};
+
+export class Articulation extends Modifier {
+  static get CATEGORY() { return 'articulations'; }
+  static get INITIAL_OFFSET() { return -0.5; }
+
+  // FIXME:
+  // Most of the complex formatting logic (ie: snapping to space) is
+  // actually done in .render(). But that logic belongs in this method.
+  //
+  // Unfortunately, this isn't possible because, by this point, stem lengths
+  // have not yet been finalized. Finalized stem lengths are required to determine the
+  // initial position of any stem-side articulation.
+  //
+  // This indicates that all objects should have their stave set before being
+  // formatted. It can't be an optional if you want accurate vertical positioning.
+  // Consistently positioned articulations that play nice with other modifiers
+  // won't be possible until we stop relying on render-time formatting.
+  //
+  // Ideally, when this function has completed, the vertical articulation positions
+  // should be ready to render without further adjustment. But the current state
+  // is far from this ideal.
+  static format(articulations, state) {
+    if (!articulations || articulations.length === 0) return false;
+
+    const isAbove = artic => artic.getPosition() === ABOVE;
+    const isBelow = artic => artic.getPosition() === BELOW;
+    const margin = 0.5;
+    const getIncrement = (articulation, line, position) =>
+      roundToNearestHalf(
+        getRoundingFunction(line, position),
+        (articulation.glyph.getMetrics().height / 10) + margin
+      );
+
+    articulations
+      .filter(isAbove)
+      .forEach(articulation => {
+        articulation.setTextLine(state.top_text_line);
+        state.top_text_line += getIncrement(articulation, state.top_text_line, ABOVE);
+      });
+
+    articulations
+      .filter(isBelow)
+      .forEach(articulation => {
+        articulation.setTextLine(state.text_line);
+        state.text_line += getIncrement(articulation, state.text_line, BELOW);
+      });
+
+    const width = articulations
+      .map(articulation => articulation.getWidth())
+      .reduce((maxWidth, articWidth) => Math.max(articWidth, maxWidth));
+
+    state.left_shift += width / 2;
+    state.right_shift += width / 2;
+    return true;
+  }
+
+  static easyScoreHook({ articulations }, note, builder) {
+    if (!articulations) return;
+
+    const articNameToCode = {
+      staccato: 'a.',
+      tenuto: 'a-',
+    };
+
+    articulations
+      .split(',')
+      .map(articString => articString.trim().split('.'))
+      .map(([name, position]) => {
+        const artic = { type: articNameToCode[name] };
+        if (position) artic.position = Modifier.PositionString[position];
+        return builder.getFactory().Articulation(artic);
+      })
+      .map(artic => note.addModifier(0, artic));
+  }
+
+  // Create a new articulation of type `type`, which is an entry in
+  // `Vex.Flow.articulationCodes` in `tables.js`.
+  constructor(type) {
+    super();
+    this.setAttribute('type', 'Articulation');
+
+    this.note = null;
+    this.index = null;
+    this.type = type;
+    this.position = BELOW;
+    this.render_options = {
+      font_scale: 38,
+    };
+
+    //VexFlowPatch
+    this.breathMarkDistance = 0.8; // % distance to next note or end of stave (0.8 = 80%)
+    this.articulation = Flow.articulationCodes(this.type);
+    if (this.type === 'abr') { // breath mark. we could put this in tables.js:articulationCodes()
+      this.articulation = { code: 'v6c', between_lines: false }; // v6c: breathmarkcomma
+    }
+    if (!this.articulation) {
+      throw new Vex.RERR('ArgumentError', `Articulation not found: ${this.type}`);
+    }
+
+    this.glyph = new Glyph(this.articulation.code, this.render_options.font_scale);
+
+    this.setWidth(this.glyph.getMetrics().width);
+  }
+
+  getCategory() { return Articulation.CATEGORY; }
+
+  // VexFlowPatch: the other articulations at this time on the side of this one: those of the other voices' notes in the
+  //   staff, which share this articulation's ModifierContext, and so the text lines that format() gave its articulations
+  getOtherArticulationsOnSameSide() {
+    if (!isStaveNote(this.note)) {
+      return [];
+    }
+    const articulations = this.getModifierContext()?.getModifiers(Articulation.CATEGORY) ?? [];
+    return articulations.filter(articulation => articulation.getPosition() === this.position &&
+      articulation.note !== this.note && isStaveNote(articulation.note));
+  }
+
+  // VexFlowPatch: the y from which the text line of this articulation is counted (see draw()): its note's stem tip or head
+  //   with a distance, or, for an articulation that is moved out of the staff, the line it's moved to less its text line
+  getTextLineBaseY() {
+    const { note, position, text_line: textLine } = this;
+    const stave = note.getStave();
+    const staffSpace = stave.getSpacingBetweenLines();
+    const sitsOutsideStaff = !this.articulation.between_lines || note.getCategory() === 'tabnotes';
+    const initialOffset = getInitialOffset(note, position);
+    if (position === ABOVE) {
+      const baseY = getTopY(note, textLine) - initialOffset * staffSpace;
+      return sitsOutsideStaff
+        ? Math.min(stave.getYForTopText(Articulation.INITIAL_OFFSET) + textLine * staffSpace, baseY)
+        : baseY;
+    }
+    const baseY = getBottomY(note, textLine) + initialOffset * staffSpace;
+    return sitsOutsideStaff
+      ? Math.max(stave.getYForBottomText(Articulation.INITIAL_OFFSET) - textLine * staffSpace, baseY)
+      : baseY;
+  }
+
+  // Render articulation in position next to note.
+  draw() {
+    const {
+      note, index, position, glyph,
+      context: ctx,
+    } = this;
+
+    this.checkContext();
+
+    if (!note || index == null) {
+      throw new Vex.RERR('NoAttachedNote', "Can't draw Articulation without a note and index.");
+    }
+
+    this.setRendered();
+
+    const stave = note.getStave();
+
+    // Articulations are centered over/under the note head.
+    let { x } = note.getModifierStartXY(position, index);
+    // VexFlowPatch: breath mark support
+    if (this.type === 'abr') { // breath mark
+      // placed by the distance to the next note's time (tick context), so not moved with a note moved aside from another
+      //   voice's note (its x_shift, which getModifierStartXY() adds): that brought it closer to the next note, e.g. onto its stem
+      if (isStaveNote(note)) {
+        x -= note.getXShift();
+      }
+      let delayXShift = 0;
+      // delay code similar to ornament.js delayed variable handling
+      const noteTickContext = note.getTickContext();
+      const nextContext = TickContext.getNextContext(noteTickContext);
+      const noteX = noteTickContext.getX();
+      // TODO somehow for some samples there's a NextContext after the last note in the measure, see #1548,
+      //   so we ignore it if its x value is smaller (further left).
+      if (nextContext && nextContext.x > noteTickContext.x) {
+          delayXShift = (nextContext.getX() - noteX) * this.breathMarkDistance;
+      } else {
+          const stave = note.getStave();
+          delayXShift = (stave.getX() + stave.getWidth() - noteX + stave.start_x) * this.breathMarkDistance;
+      }
+      x += delayXShift;
+      if (x > stave.end_x) {
+        // fix for going beyond end of measure in certain cases (see #1548)
+        //   TODO not sure why the metrics don't result in the correct x position, as we do consider end_x etc
+        const noteXAbsolute = stave.start_x + noteX;
+        x = noteXAbsolute + (stave.end_x - noteXAbsolute) * this.breathMarkDistance;
+      }
+    }
+    const x_shift = this.getXShift();
+    if (x_shift) {
+      x += x_shift; // VexFlowPatch: support x_shift for breath_mark
+    }
+    const y = this.getRenderY();
+
+    L(`Rendering articulation at (x: ${x}, y: ${y})`);
+
+    glyph.render(ctx, x, y);
+  }
+
+  // VexFlowPatch: the box of the glyph as draw() renders it, e.g. for a slur that starts or ends at the note to keep its distance
+  //   from it before drawing (see OSMD's GraphicalSlur): left and right from the centre of the note head, which draw() centres
+  //   the glyph on (getModifierStartXY(), not for a breath mark, which it places after the note), top and bottom in the stave's
+  //   coordinates
+  getExtent() {
+    const { note, glyph } = this;
+    // a note's ys follow the stave only when its voice draws it (see Ornament.getRenderXY())
+    note.setStave(note.getStave());
+    const top = this.getRenderY() + glyph.originShift.y + glyph.bbox.getY(); // (getRenderY() sets the glyph's origin)
+    const left = this.getXShift() + glyph.originShift.x + glyph.bbox.getX();
+    return { left, right: left + glyph.bbox.getW(), top, bottom: top + glyph.bbox.getH() };
+  }
+
+  // VexFlowPatch: the y at which draw() renders the glyph, with the glyph's origin set for it (from draw(), to get it before drawing)
+  getRenderY() {
+    const {
+      note, index, position, glyph,
+      articulation: { between_lines: canSitBetweenLines },
+      text_line: textLine,
+    } = this;
+    const stave = note.getStave();
+    const staffSpace = stave.getSpacingBetweenLines();
+    const isTab = note.getCategory() === 'tabnotes';
+    const shouldSitOutsideStaff = !canSitBetweenLines || isTab;
+
+    const initialOffset = getInitialOffset(note, position);
+
+    let y = {
+      [ABOVE]: () => {
+        glyph.setOrigin(0.5, 1);
+        const y = getTopY(note, textLine) - ((textLine + initialOffset) * staffSpace);
+        return shouldSitOutsideStaff
+          ? Math.min(stave.getYForTopText(Articulation.INITIAL_OFFSET), y)
+          : y;
+      },
+      [BELOW]: () => {
+        glyph.setOrigin(0.5, 0);
+        const y = getBottomY(note, textLine) + ((textLine + initialOffset) * staffSpace);
+        return shouldSitOutsideStaff
+          ? Math.max(stave.getYForBottomText(Articulation.INITIAL_OFFSET), y)
+          : y;
+      },
+    }[position]();
+    // VexFlowPatch: the text line of an articulation (see format()) is also counted from the bases of the articulations at
+    //   this time on its side of the other voices' notes in the staff (see getTextLineBaseY()), not only from its own note:
+    //   e.g. the fermata of a stem-down note, on text line 2, was drawn below the fermata on text line 0 above the stem of the
+    //   stem-up note of another voice a second above, over it and that stem, and the fermatas of two whole notes low in the
+    //   staff were both moved out of it to the same line.
+    for (const other of this.getOtherArticulationsOnSameSide()) {
+      // a note's ys follow the stave only when its voice draws it (see Ornament.getRenderXY())
+      other.note.setStave(other.note.getStave());
+      y = position === ABOVE
+        ? Math.min(y, other.getTextLineBaseY() - textLine * staffSpace)
+        : Math.max(y, other.getTextLineBaseY() + textLine * staffSpace);
+    }
+    // VexFlowPatch: respect modifier.y_shift
+    if (this.y_shift) {
+        y += this.y_shift;
+    }
+
+    if (!isTab) {
+      const offsetDirection = position === ABOVE ? -1 : +1;
+      const noteLine = isTab ? note.positions[index].str : note.getKeyProps()[index].line;
+      const distanceFromNote = (note.getYs()[index] - y) / staffSpace;
+      const articLine = distanceFromNote + noteLine;
+      const snappedLine = snapLineToStaff(canSitBetweenLines, articLine, position, offsetDirection);
+
+      if (isWithinLines(snappedLine, position)) glyph.setOrigin(0.5, 0.5);
+
+      y += Math.abs(snappedLine - articLine) * staffSpace * offsetDirection;
+    }
+    return y;
+  }
+}
